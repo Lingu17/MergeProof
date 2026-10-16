@@ -327,12 +327,13 @@ def execute_investigation(handler, investigation):
                      completed_roles=[item["role"] for item in [store.find("test_runs", run_id) for run_id in run_ids]])
     runs = [store.find("test_runs", item_id) for item_id in run_ids]
     confirmed = _confirmed(runs)
+    all_passed = bool(runs) and all(run.get("status") == "passed" for run in runs)
     report = {"id": str(uuid.uuid4()), "investigation_id": investigation["id"], "execution_id": execution_id, "run_ids": run_ids, "runs": runs,
               "repository": {"repository_id": repo["id"], "branch_a": details.get("branch_a"), "branch_b": details.get("branch_b"), "branch_a_sha": details.get("branch_a_sha"), "branch_b_sha": details.get("branch_b_sha"), "common_base": details.get("common_base")},
               # A non-confirmed run is not automatically a risk: setup and
               # execution errors, and an all-green run, provide no interaction
               # evidence.  Keep the risk count evidence-based.
-              "summary": {"confirmed": int(confirmed), "likely_risks": 0, "suggestions": 0 if confirmed else 1},
+               "summary": {"confirmed": int(confirmed), "likely_risks": 0, "suggestions": 0 if confirmed or all_passed else 1},
               "findings": report_findings(confirmed, refs, runs), "generated_at": now()}
     store.save("reports", report)
     finished = now()
