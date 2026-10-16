@@ -5,5 +5,4 @@ __pycache__/
 *.pyc
 mergeproof-data.json
 *.corrupt-backup
-tests/
 demo_repo/*/__pycache__/
