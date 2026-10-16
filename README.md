@@ -47,7 +47,7 @@ The Docker image sets `MERGEPROOF_BIND_HOST=0.0.0.0` because published ports nee
 Run the offline regression suite inside the image with:
 
 ```bash
-docker run --rm mergeproof python -m unittest discover -s tests -v
+docker run --network=none --rm mergeproof python -m unittest discover -s tests -v
 ```
 
 To analyze a host repository, mount it read-only into the container and use the mounted path in the Repositories screen, for example:
