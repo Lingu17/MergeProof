@@ -1,10 +1,16 @@
 import json
+import io
+import http.client
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
+import zipfile
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from app import Store, analysis, inspect_repository, run_branch, run_command, run_combined, _confirmed, collection_view, overview, report_findings
+from app import Handler, Store, analysis, inspect_repository, run_branch, run_command, run_combined, _confirmed, collection_view, overview, report_findings, evidence_bundle
 
 
 class BackendTests(unittest.TestCase):
@@ -13,6 +19,43 @@ class BackendTests(unittest.TestCase):
         # Test repositories must never depend on a user's global Git config.
         subprocess.run(["git", "-C", str(repo), "config", "--local", "user.email", "test@example.com"], check=True)
         subprocess.run(["git", "-C", str(repo), "config", "--local", "user.name", "Test"], check=True)
+
+    def _http_server(self, store):
+        class TestHandler(Handler):
+            pass
+        TestHandler.store = store
+        TestHandler.worker = None
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread, TestHandler
+
+    def _request(self, server, path, method="GET"):
+        connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+        connection.request(method, path, body=b"{}" if method == "POST" else None, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        connection.close()
+        return response.status, body
+
+    def _real_repo_with_investigation(self, root, command):
+        repo = root / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        (repo / "test_ok.py").write_text("import unittest\nclass T(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        subprocess.run(["git", "-C", str(repo), "branch", "change_a"], check=True)
+        subprocess.run(["git", "-C", str(repo), "branch", "change_b"], check=True)
+        repo_info = {"id": "repo-async", **inspect_repository({"id": "repo-async", "path": str(repo)})}
+        investigation = {"id": "investigation-async", "repository_id": repo_info["id"], "branch_a": "change_a", "branch_b": "change_b", "test_command": command, "status": "created", "created_at": "2026-01-01"}
+        return repo_info, investigation
+
+    def _stop_http_server(self, server, handler_type):
+        server.shutdown()
+        server.server_close()
+        if handler_type.worker is not None:
+            handler_type.worker.shutdown()
 
     def test_store_persists_sample_entry_and_records(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -92,13 +135,120 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(findings[0]["title"], "No conflict detected by these checks")
         self.assertNotIn("Likely Risk", {finding["classification"] for finding in findings})
 
+    def test_evidence_bundle_contains_report_logs_and_reproduction(self):
+        bundle = evidence_bundle({"id": "r1", "investigation_id": "i1", "execution_id": "e1", "runs": [{"role": "combined", "command": "python -m unittest", "status": "failed", "full_log": "AssertionError"}], "findings": [{"source_refs": [{"kind": "Change A", "text": "diff --git"}]}]})
+        with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
+            names = set(archive.namelist())
+            self.assertIn("report.json", names)
+            self.assertIn("REPRODUCE.md", names)
+            self.assertIn("logs/1-combined.log", names)
+            self.assertIn("sources/finding-1-1.diff", names)
+
     def test_store_marks_running_investigations_interrupted_on_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "data.json"
             store = Store(path)
             store.save("investigations", {"id": "running", "status": "running"})
+            store.save("investigations", {"id": "queued", "status": "queued"})
             restarted = Store(path)
         self.assertEqual(restarted.find("investigations", "running")["status"], "interrupted")
+        self.assertEqual(restarted.find("investigations", "queued")["status"], "interrupted")
+
+    def test_background_start_returns_promptly_and_persists_progress_and_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "data.json"
+            store = Store(path)
+            repo, investigation = self._real_repo_with_investigation(root, 'python -c "import time; time.sleep(0.3)"')
+            store.save("repositories", repo)
+            store.save("investigations", investigation)
+            server, _, handler_type = self._http_server(store)
+            try:
+                started = time.monotonic()
+                status, response = self._request(server, "/api/investigations/investigation-async/start", "POST")
+                elapsed = time.monotonic() - started
+                self.assertEqual(status, 202)
+                self.assertEqual(response["status"], "queued")
+                self.assertLess(elapsed, 0.5)
+                saved = store.find("investigations", "investigation-async")
+                self.assertEqual(saved["progress"]["total"], 3)
+                self.assertEqual(saved["progress_percent"], 0)
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    _, progress = self._request(server, "/api/investigations/investigation-async/progress")
+                    if progress["status"] == "completed":
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(progress["status"], "completed")
+                self.assertEqual(progress["progress"], {"completed": 3, "total": 3, "percent": 100, "label": "3 of 3 complete", "current_role": None})
+                persisted = Store(path)
+                self.assertEqual(persisted.find("investigations", "investigation-async")["progress_percent"], 100)
+                history_status, history = self._request(server, "/api/investigations/investigation-async/history")
+                self.assertEqual(history_status, 200)
+                self.assertEqual(len(history["executions"]), 1)
+                self.assertEqual(len(history["executions"][0]["runs"]), 3)
+                _, runs = self._request(server, "/api/investigations/investigation-async/runs?history=1")
+                self.assertEqual(len(runs["runs"]), 3)
+            finally:
+                self._stop_http_server(server, handler_type)
+
+    def test_background_investigation_can_be_cancelled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root / "data.json")
+            repo, investigation = self._real_repo_with_investigation(root, 'python -c "import time; time.sleep(5)"')
+            store.save("repositories", repo)
+            store.save("investigations", investigation)
+            server, _, handler_type = self._http_server(store)
+            try:
+                self.assertEqual(self._request(server, "/api/investigations/investigation-async/start", "POST")[0], 202)
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    _, progress = self._request(server, "/api/investigations/investigation-async/progress")
+                    if progress["status"] == "running":
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(progress["status"], "running")
+                cancel_status, cancelled = self._request(server, "/api/investigations/investigation-async/cancel", "POST")
+                self.assertEqual(cancel_status, 200)
+                self.assertEqual(cancelled["status"], "cancelled")
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    _, progress = self._request(server, "/api/investigations/investigation-async/progress")
+                    if progress["status"] == "cancelled" and progress.get("finished_at"):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(progress["status"], "cancelled")
+                _, runs = self._request(server, "/api/investigations/investigation-async/runs?history=1")
+                self.assertTrue(all(run["status"] == "cancelled" for run in runs["runs"]))
+            finally:
+                self._stop_http_server(server, handler_type)
+
+    def test_interrupted_investigation_can_be_restarted_after_store_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "data.json"
+            store = Store(path)
+            repo, investigation = self._real_repo_with_investigation(root, 'python -c "pass"')
+            store.save("repositories", repo)
+            store.save("investigations", investigation)
+            store.update("investigations", investigation["id"], status="running")
+            restarted = Store(path)
+            self.assertEqual(restarted.find("investigations", investigation["id"])["status"], "interrupted")
+            server, _, handler_type = self._http_server(restarted)
+            try:
+                status, response = self._request(server, "/api/investigations/investigation-async/start", "POST")
+                self.assertEqual(status, 202)
+                self.assertIn(response["status"], ("queued", "running"))
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    _, progress = self._request(server, "/api/investigations/investigation-async/progress")
+                    if progress["status"] == "completed":
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(progress["status"], "completed")
+            finally:
+                self._stop_http_server(server, handler_type)
 
     def test_corrupt_storage_is_preserved_and_recovery_is_actionable(self):
         with tempfile.TemporaryDirectory() as directory:
