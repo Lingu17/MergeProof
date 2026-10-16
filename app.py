@@ -45,7 +45,7 @@ def analysis() -> dict:
         "finding": {
             "title": "Discount is calculated against the pre-normalized subtotal",
             "severity": "High confidence",
-            "why": "Change A replaces the order total with a normalized USD value in `total_usd`. Change B still reads the removed `subtotal` field, so the combined checkout path raises AttributeError.",
+            "why": "Change A creates the normalized USD value in `total_usd`. Change B still calculates its 10% discount from the pre-normalized `subtotal`, so the combined test returns 98.0 instead of the expected 97.2.",
             "evidence": [
                 {"kind": "Change A", "file": "demo_repo/combined/service.py", "line": "12", "code": "order['total_usd'] = round(order['subtotal'] * rate, 2)"},
                 {"kind": "Change B", "file": "demo_repo/combined/service.py", "line": "18", "code": "discount = order['subtotal'] * 0.10"},
