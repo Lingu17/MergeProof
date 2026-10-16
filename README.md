@@ -44,6 +44,23 @@ docker run --rm -p 8000:8000 -e MERGEPROOF_BIND_HOST=0.0.0.0 mergeproof
 
 The Docker image sets `MERGEPROOF_BIND_HOST=0.0.0.0` because published ports need an in-container listener; the host-only default remains in effect for direct local runs. Use a volume if investigation data must persist, for example `-v "$PWD/data:/app/data" -e MERGEPROOF_DATA_FILE=/app/data/mergeproof-data.json`.
 
+Run the offline regression suite inside the image with:
+
+```bash
+docker run --rm mergeproof python -m unittest discover -s tests -v
+```
+
+To analyze a host repository, mount it read-only into the container and use the mounted path in the Repositories screen, for example:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e MERGEPROOF_BIND_HOST=0.0.0.0 \
+  -v "$PWD/my-repository:/repos/my-repository:ro" \
+  -v "$PWD/data:/app/data" \
+  -e MERGEPROOF_DATA_FILE=/app/data/mergeproof-data.json \
+  mergeproof
+```
+
 The project is released under the MIT License (`LICENSE`).
 
 The UI is a local-only application: it does not provide hosted accounts, billing, teams, or remote provider imports. Repository import currently means a path to a local Git checkout. `/api/health` exposes the backend version used by the UI; `/api/overview` provides live dashboard counts and recent activity.
