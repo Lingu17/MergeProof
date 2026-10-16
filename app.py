@@ -19,6 +19,7 @@ DATA_FILE = Path(os.environ.get("MERGEPROOF_DATA_FILE", ROOT / "mergeproof-data.
 PORT = int(os.environ.get("MERGEPROOF_PORT", "8000"))
 DEFAULT_COMMAND = "python -m unittest discover -v"
 SAMPLE_COMMAND = "Built-in sample checks (fixed)"
+API_VERSION = "2026.10.1"
 
 
 def now() -> str:
@@ -31,6 +32,12 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.data = self._load()
+        # A process cannot resume a subprocess after restart.  Make abandoned
+        # work explicit while retaining all runs/logs already persisted.
+        for investigation in self.data["investigations"]:
+            if investigation.get("status") == "running":
+                investigation.update({"status": "interrupted", "error": "backend restarted while investigation was running", "finished_at": now()})
+        self._write()
 
     def _load(self):
         if self.path.exists():
@@ -87,9 +94,12 @@ def validate_repository(path: str) -> dict:
         return {"path": str(location), "valid": True, "head": "sample", "branches": ["change_a", "change_b"],
                 "name": "checkout-service (sample)", "checked_at": now()}
     git(location, "rev-parse", "--is-inside-work-tree")
-    branches = git(location, "for-each-ref", "refs/heads", "--format=%(refname:short)").stdout.splitlines()
+    # Include branches that exist only on a remote-tracking ref.  They are
+    # valid investigation inputs even when the working copy has no local head.
+    branches = git(location, "for-each-ref", "refs/heads", "refs/remotes", "--format=%(refname:short)").stdout.splitlines()
+    branches = sorted({b[7:] if b.startswith("origin/") else b for b in branches if b != "origin/HEAD"})
     head = git(location, "branch", "--show-current", check=False).stdout.strip() or "HEAD"
-    return {"path": str(location), "valid": True, "head": head, "branches": branches,
+    return {"path": str(location), "valid": True, "head": head, "head_sha": git(location, "rev-parse", "HEAD").stdout.strip(), "branches": branches,
             "name": location.name, "checked_at": now()}
 
 
@@ -105,8 +115,9 @@ def inspect_repository(repo: dict, branch_a=None, branch_b=None) -> dict:
         if repo.get("sample") or Path(info["path"]).resolve() == (ROOT / "demo_repo").resolve():
             info.update({"branch_a": branch_a, "branch_b": branch_b, "common_base": "sample-base", "common_base_short": "sample-base"})
             return info
-        base = git(Path(info["path"]), "merge-base", branch_a, branch_b).stdout.strip()
-        info.update({"branch_a": branch_a, "branch_b": branch_b, "common_base": base, "common_base_short": base[:12]})
+        source = Path(info["path"])
+        base = git(source, "merge-base", _git_ref(source, branch_a), _git_ref(source, branch_b)).stdout.strip()
+        info.update({"branch_a": branch_a, "branch_b": branch_b, "branch_a_sha": _sha(source, branch_a), "branch_b_sha": _sha(source, branch_b), "common_base": base, "common_base_short": base[:12]})
     return info
 
 
@@ -127,17 +138,41 @@ def run_command(cwd: Path, command: str, timeout: int = 300) -> dict:
         result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
         log = (result.stdout + result.stderr).strip()
         status = "passed" if result.returncode == 0 else "failed"
-        result_type = "passed" if result.returncode == 0 else "test_failure"
+        result_type = "passed" if result.returncode == 0 else classify_failure(log, command)
         return {"command": command, "status": status, "result_type": result_type, "exit_code": result.returncode, "output": log, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
     except subprocess.TimeoutExpired as exc:
         log = (_output(exc.stdout) + _output(exc.stderr)).strip() or f"Command timed out after {timeout} seconds."
-        return {"command": command, "status": "timeout", "exit_code": -1, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
+        return {"command": command, "status": "timeout", "result_type": "execution_error", "exit_code": -1, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
     except FileNotFoundError as exc:
         log = f"Command not found: {args[0] if 'args' in locals() and args else command} ({exc})"
-        return {"command": command, "status": "missing_command", "exit_code": -1, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
+        return {"command": command, "status": "missing_command", "result_type": "dependency_error", "exit_code": -1, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
     except (OSError, ValueError) as exc:
         log = str(exc)
-        return {"command": command, "status": "setup_error", "exit_code": -1, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
+        return {"command": command, "status": "setup_error", "result_type": "execution_error", "exit_code": -1, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
+
+
+def classify_failure(log: str, command: str = "") -> str:
+    text = (log or "").lower()
+    if "syntaxerror" in text or "indentationerror" in text:
+        return "syntax_error"
+    if any(token in text for token in ("modulenotfounderror", "importerror", "no module named", "command not found")):
+        return "dependency_error"
+    if any(token in text for token in ("assertionerror", "failed (failures=", "failed (errors=")):
+        return "test_failure"
+    if not text and any(tool in command.lower() for tool in ("unittest", "pytest", "nose")):
+        return "test_failure"
+    if "sys.exit" in command.lower():
+        return "test_failure"
+    return "execution_error"
+
+
+def _git_ref(source: Path, branch: str) -> str:
+    local = git(source, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+    return branch if local.returncode == 0 else f"refs/remotes/origin/{branch}"
+
+
+def _sha(source: Path, branch: str) -> str:
+    return git(source, "rev-parse", _git_ref(source, branch)).stdout.strip()
 
 
 def _clone(source: Path, destination: Path):
@@ -151,11 +186,12 @@ def run_branch(source: Path, branch: str, command: str) -> dict:
         destination = Path(temporary) / "repo"
         try:
             _clone(source, destination)
-            git(destination, "checkout", "--quiet", branch)
-            git(destination, "reset", "--hard", branch)
+            ref = branch if git(destination, "rev-parse", "--verify", f"refs/heads/{branch}", check=False).returncode == 0 else f"origin/{branch}"
+            git(destination, "checkout", "--quiet", ref)
+            git(destination, "reset", "--hard", ref)
             git(destination, "clean", "-fdx")
         except (ValueError, OSError) as exc:
-            return {"command": command, "status": "setup_error", "exit_code": -1, "log": str(exc), "full_log": str(exc), "started_at": now(), "finished_at": now()}
+            return {"command": command, "status": "setup_error", "result_type": "execution_error", "exit_code": -1, "log": str(exc), "full_log": str(exc), "started_at": now(), "finished_at": now()}
         return run_command(destination, command)
 
 
@@ -176,7 +212,7 @@ def run_combined(source: Path, branch_a: str, branch_b: str, base: str, command:
                 git(destination, "merge", "--abort", check=False)
                 return {"command": command, "status": "merge_conflict", "exit_code": merge.returncode, "log": "Merge conflict before tests\n" + log, "full_log": "Merge conflict before tests\n" + log, "started_at": now(), "finished_at": now()}
         except (ValueError, OSError) as exc:
-            return {"command": command, "status": "setup_error", "exit_code": -1, "log": str(exc), "full_log": str(exc), "started_at": now(), "finished_at": now()}
+            return {"command": command, "status": "setup_error", "result_type": "execution_error", "exit_code": -1, "log": str(exc), "full_log": str(exc), "started_at": now(), "finished_at": now()}
         return run_command(destination, command)
 
 
@@ -193,9 +229,16 @@ def report_findings(confirmed: bool, source_refs=None):
 def source_references(source: Path, base: str, branch_a: str, branch_b: str):
     references = []
     for label, branch in (("Change A", branch_a), ("Change B", branch_b)):
-        diff = git(source, "diff", "--unified=3", f"{base}..{branch}", "--", check=False)
+        ref = _git_ref(source, branch)
+        diff = git(source, "diff", "--unified=3", f"{base}..{ref}", "--", check=False)
         text = (diff.stdout or diff.stderr).strip()
-        references.append({"kind": label, "command": f"git diff --unified=3 {base[:12]}..{branch}", "text": text[:12000] or "No textual diff available."})
+        snippets = []
+        names = git(source, "diff", "--name-only", f"{base}..{ref}", "--", check=False).stdout.splitlines()
+        for name in names[:20]:
+            content = git(source, "show", f"{ref}:{name}", check=False).stdout
+            if content:
+                snippets.append({"file": name, "text": content[:6000]})
+        references.append({"kind": label, "branch": branch, "sha": _sha(source, branch), "command": f"git diff --unified=3 {base[:12]}..{branch}", "text": text[:12000] or "No textual diff available.", "snippets": snippets})
     return references
 
 
@@ -216,6 +259,26 @@ def _confirmed(runs):
             bool(by_role.get("combined", {}).get("log")))
 
 
+def collection_view(store, collection, query):
+    items = list(store.data[collection])
+    search = (query.get("search", [""])[0] or "").lower()
+    if search:
+        items = [item for item in items if search in json.dumps(item).lower()]
+    try:
+        page = max(1, int(query.get("page", ["1"])[0]))
+        size = min(100, max(1, int(query.get("page_size", ["50"])[0])))
+    except ValueError:
+        page, size = 1, 50
+    start = (page - 1) * size
+    return {collection: items[start:start + size], "page": page, "page_size": size, "total": len(items), "has_more": start + size < len(items)}
+
+
+def overview(store):
+    investigations = store.data["investigations"]
+    confirmed = sum(bool(r.get("summary", {}).get("confirmed")) for r in store.data["reports"])
+    return {"api_version": API_VERSION, "counts": {"repositories": len(store.data["repositories"]), "investigations": len(investigations), "test_runs": len(store.data["test_runs"]), "reports": len(store.data["reports"]), "completed": sum(i.get("status") == "completed" for i in investigations), "running": sum(i.get("status") == "running" for i in investigations)}, "confirmed_findings": confirmed, "recent_activity": sorted(investigations, key=lambda x: x.get("created_at", ""), reverse=True)[:10]}
+
+
 def execute_investigation(handler, investigation):
     store = handler.store
     repo = store.find("repositories", investigation["repository_id"])
@@ -234,24 +297,28 @@ def execute_investigation(handler, investigation):
         refs = sample["finding"].get("evidence", [])
     else:
         source = Path(repo["path"])
-        results = [("independent_a", run_branch(source, investigation["branch_a"], command)),
-                   ("independent_b", run_branch(source, investigation["branch_b"], command)),
-                   ("combined", run_combined(source, investigation["branch_a"], investigation["branch_b"], details["common_base"], command))]
+        results = [("independent_a", lambda: run_branch(source, investigation["branch_a"], command)),
+                   ("independent_b", lambda: run_branch(source, investigation["branch_b"], command)),
+                   ("combined", lambda: run_combined(source, investigation["branch_a"], investigation["branch_b"], details["common_base"], command))]
         refs = source_references(source, details["common_base"], investigation["branch_a"], investigation["branch_b"])
     execution_id = str(uuid.uuid4())
     run_ids = []
     for role, result in results:
+        result = result() if callable(result) else result
         result = {**result, "id": str(uuid.uuid4()), "investigation_id": investigation["id"], "execution_id": execution_id, "role": role}
         store.save("test_runs", result)
         run_ids.append(result["id"])
+        store.update("investigations", investigation["id"], run_ids=run_ids, latest_execution_id=execution_id,
+                     completed_roles=[item["role"] for item in [store.find("test_runs", run_id) for run_id in run_ids]])
     runs = [store.find("test_runs", item_id) for item_id in run_ids]
     confirmed = _confirmed(runs)
     report = {"id": str(uuid.uuid4()), "investigation_id": investigation["id"], "execution_id": execution_id, "run_ids": run_ids, "runs": runs,
+              "repository": {"repository_id": repo["id"], "branch_a": details.get("branch_a"), "branch_b": details.get("branch_b"), "branch_a_sha": details.get("branch_a_sha"), "branch_b_sha": details.get("branch_b_sha"), "common_base": details.get("common_base")},
               "summary": {"confirmed": int(confirmed), "likely_risks": 0 if confirmed else 1, "suggestions": 0 if confirmed else 1},
               "findings": report_findings(confirmed, refs), "generated_at": now()}
     store.save("reports", report)
     finished = now()
-    store.update("investigations", investigation["id"], status="completed", run_ids=run_ids, report_id=report["id"], latest_execution_id=execution_id, completed_at=finished, finished_at=finished)
+    store.update("investigations", investigation["id"], status="completed", run_ids=run_ids, report_id=report["id"], latest_execution_id=execution_id, completed_at=finished, finished_at=finished, common_base=details.get("common_base"), branch_a_sha=details.get("branch_a_sha"), branch_b_sha=details.get("branch_b_sha"))
     return report
 
 
@@ -269,8 +336,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         parsed = urlparse(self.path); parts = [p for p in parsed.path.split("/") if p]; query = parse_qs(parsed.query)
         try:
+            if parsed.path in ("/api/health", "/api/status"):
+                self.send_json({"status": "ok", "api_version": API_VERSION, "service": "mergeproof", "time": now()}); return
+            if parsed.path in ("/api/overview", "/api/dashboard"):
+                self.send_json(overview(self.store)); return
             if parsed.path == "/api/analysis": self.send_json(analysis()); return
-            if parsed.path == "/api/repositories": self.send_json({"repositories": self.store.data["repositories"]}); return
+            if parsed.path == "/api/repositories": self.send_json(collection_view(self.store, "repositories", query)); return
             if len(parts) == 4 and parts[:2] == ["api", "repositories"] and parts[3] == "inspect":
                 repo = self.store.find("repositories", parts[2]);
                 if not repo: raise KeyError("repository not found")
@@ -279,7 +350,7 @@ class Handler(BaseHTTPRequestHandler):
                 repo = self.store.find("repositories", parts[2]);
                 if not repo: raise KeyError("repository not found")
                 self.send_json({**repo, **validate_repository(repo["path"])}); return
-            if parsed.path == "/api/investigations": self.send_json({"investigations": self.store.data["investigations"]}); return
+            if parsed.path == "/api/investigations": self.send_json(collection_view(self.store, "investigations", query)); return
             if len(parts) == 3 and parts[:2] == ["api", "investigations"]:
                 item = self.store.find("investigations", parts[2]);
                 if not item: raise KeyError("investigation not found")
@@ -288,7 +359,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.store.find("investigations", parts[2]): raise KeyError("investigation not found")
                 investigation = self.store.find("investigations", parts[2])
                 latest = investigation.get("latest_execution_id")
-                runs = [x for x in self.store.data["test_runs"] if x["investigation_id"] == parts[2] and (not latest or x.get("execution_id") == latest)]
+                runs = [x for x in self.store.data["test_runs"] if x["investigation_id"] == parts[2] and (query.get("history") == ["1"] or not latest or x.get("execution_id") == latest)]
+                if query.get("history") == ["1"]:
+                    try:
+                        page = max(1, int(query.get("page", ["1"])[0])); size = min(100, max(1, int(query.get("page_size", ["50"])[0])))
+                    except ValueError:
+                        page, size = 1, 50
+                    start = (page - 1) * size
+                    runs = runs[start:start + size]
+                    self.send_json({"runs": runs, "execution_id": latest, "page": page, "page_size": size, "total": len([x for x in self.store.data["test_runs"] if x["investigation_id"] == parts[2]])}); return
                 self.send_json({"runs": runs, "execution_id": latest}); return
             if len(parts) == 3 and parts[:2] == ["api", "test-runs"]:
                 run = self.store.find("test_runs", parts[2]);

@@ -32,3 +32,5 @@ python -m unittest discover -s tests -v
 ```
 
 The project is released under the MIT License (`LICENSE`).
+
+The UI is a local-only application: it does not provide hosted accounts, billing, teams, or remote provider imports. Repository import currently means a path to a local Git checkout. `/api/health` exposes the backend version used by the UI; `/api/overview` provides live dashboard counts and recent activity.

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app import Store, analysis, inspect_repository, run_branch, run_command, run_combined, _confirmed
+from app import Store, analysis, inspect_repository, run_branch, run_command, run_combined, _confirmed, collection_view, overview
 
 
 class BackendTests(unittest.TestCase):
@@ -28,9 +28,12 @@ class BackendTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-qm", "initial"], check=True)
             current = subprocess.check_output(["git", "-C", str(repo), "branch", "--show-current"], text=True).strip()
             subprocess.run(["git", "-C", str(repo), "branch", "change-a"], check=True)
+            sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/origin/remote-only", sha], check=True)
             metadata = {"id": "r1", "path": str(repo)}
             inspected = inspect_repository(metadata, current, "change-a")
             self.assertEqual(inspected["branch_a"], current)
+            self.assertIn("remote-only", inspected["branches"])
             result = run_branch(repo, "change-a", "python -m unittest discover -v")
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["exit_code"], 0)
@@ -53,6 +56,36 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(timeout["status"], "timeout")
         for result in (failed, missing, timeout):
             self.assertLessEqual(result["started_at"], result["finished_at"])
+
+    def test_command_results_classify_syntax_import_and_execution_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            syntax = run_command(root, "python -c \"raise SyntaxError('bad')\"")
+            dependency = run_command(root, "python -c \"raise ModuleNotFoundError('x')\"")
+            execution = run_command(root, "python -c \"raise RuntimeError('boom')\"")
+        self.assertEqual(syntax["result_type"], "syntax_error")
+        self.assertEqual(dependency["result_type"], "dependency_error")
+        self.assertEqual(execution["result_type"], "execution_error")
+
+    def test_store_marks_running_investigations_interrupted_on_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.json"
+            store = Store(path)
+            store.save("investigations", {"id": "running", "status": "running"})
+            restarted = Store(path)
+        self.assertEqual(restarted.find("investigations", "running")["status"], "interrupted")
+
+    def test_overview_and_collection_view_support_counts_search_and_pagination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "data.json")
+            store.save("investigations", {"id": "one", "status": "completed", "created_at": "2026-01-01"})
+            store.save("investigations", {"id": "two", "status": "created", "created_at": "2026-01-02"})
+            result = collection_view(store, "investigations", {"search": ["one"], "page": ["1"], "page_size": ["1"]})
+            dashboard = overview(store)
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["investigations"][0]["id"], "one")
+        self.assertEqual(dashboard["counts"]["investigations"], 2)
+        self.assertEqual(dashboard["counts"]["completed"], 1)
 
     def test_same_branch_is_rejected_and_merge_conflict_is_not_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
