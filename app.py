@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).parent
 DATA_FILE = Path(os.environ.get("MERGEPROOF_DATA_FILE", ROOT / "mergeproof-data.json"))
+PORT = int(os.environ.get("MERGEPROOF_PORT", "8000"))
 
 
 def now() -> str:
@@ -75,6 +76,8 @@ def validate_repository(path: str) -> dict:
     location = Path(path).expanduser().resolve()
     if not location.is_dir():
         raise ValueError("repository path is not a directory")
+    if location == (ROOT / "demo_repo").resolve():
+        return {"path": str(location), "valid": True, "head": "sample", "branches": ["change_a", "change_b"], "name": "checkout-service (sample)", "checked_at": now()}
     git(location, "rev-parse", "--is-inside-work-tree")
     branches = git(location, "for-each-ref", "refs/heads", "--format=%(refname:short)").stdout.splitlines()
     head = git(location, "branch", "--show-current", check=False).stdout.strip() or "HEAD"
@@ -89,6 +92,9 @@ def inspect_repository(repo: dict, branch_a=None, branch_b=None) -> dict:
         for branch in (branch_a, branch_b):
             if branch not in info["branches"]:
                 raise ValueError(f"unknown branch: {branch}")
+        if repo.get("sample") or Path(info["path"]).resolve() == (ROOT / "demo_repo").resolve():
+            info.update({"branch_a": branch_a, "branch_b": branch_b, "common_base": "sample-base", "common_base_short": "sample-base"})
+            return info
         base = git(Path(info["path"]), "merge-base", branch_a, branch_b).stdout.strip()
         info.update({"branch_a": branch_a, "branch_b": branch_b, "common_base": base,
                      "common_base_short": base[:12]})
@@ -141,6 +147,23 @@ def run_case(folder: str, test_file: str) -> dict:
     output = (result.stdout + result.stderr).strip()
     return {"status": "passed" if result.returncode == 0 else "failed", "exit_code": result.returncode, "output": output,
             "log": output, "full_log": output, "command": f"{sys.executable} -m unittest -v {test_file}"}
+
+
+def report_findings(confirmed: bool, source_refs=None):
+    if confirmed:
+        findings = [{"classification": "Confirmed Conflict", "title": "Combined test failure reproduced", "explanation": "Both individual branch checks passed, while the combined check failed. This is confirmed by the persisted exit codes and full logs.", "source_refs": source_refs or []}]
+    else:
+        findings = [{"classification": "Likely Risk", "title": "No confirmed interaction reproduced", "explanation": "The selected checks did not meet the pass/pass/fail rule, so this result is not marked as a confirmed conflict.", "source_refs": source_refs or []}, {"classification": "Suggested Investigation", "title": "Add or refine a cross-branch regression test", "explanation": "A targeted integration check may be needed to exercise the changed behavior together.", "source_refs": source_refs or []}]
+    return findings
+
+
+def source_references(source: Path, base: str, branch_a: str, branch_b: str):
+    references = []
+    for label, branch in (("Change A", branch_a), ("Change B", branch_b)):
+        diff = git(source, "diff", "--unified=3", f"{base}..{branch}", "--", check=False)
+        text = (diff.stdout or diff.stderr).strip()
+        references.append({"kind": label, "command": f"git diff --unified=3 {base[:12]}..{branch}", "text": text[:12000] or "No textual diff available."})
+    return references
 
 
 def analysis() -> dict:
@@ -217,11 +240,19 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["api", "investigations"] and parts[3] == "start":
                 investigation = self.store.find("investigations", parts[2]);
                 if not investigation: raise KeyError("investigation not found")
-                repo = self.store.find("repositories", investigation["repository_id"]); details = inspect_repository(repo, investigation["branch_a"], investigation["branch_b"]); command = investigation["test_command"]
-                runs = [("independent_a", run_branch(Path(repo["path"]), investigation["branch_a"], command)), ("independent_b", run_branch(Path(repo["path"]), investigation["branch_b"], command)), ("combined", run_combined(Path(repo["path"]), investigation["branch_a"], investigation["branch_b"], details["common_base"], command))]
+                repo = self.store.find("repositories", investigation["repository_id"]); command = investigation["test_command"]
+                if repo.get("sample"):
+                    sample = analysis()
+                    runs = [("independent_a", sample["tests"]["change_a"]), ("independent_b", sample["tests"]["change_b"]), ("combined", sample["tests"]["combined"])]
+                    source_refs = sample["finding"]["evidence"]
+                else:
+                    details = inspect_repository(repo, investigation["branch_a"], investigation["branch_b"])
+                    runs = [("independent_a", run_branch(Path(repo["path"]), investigation["branch_a"], command)), ("independent_b", run_branch(Path(repo["path"]), investigation["branch_b"], command)), ("combined", run_combined(Path(repo["path"]), investigation["branch_a"], investigation["branch_b"], details["common_base"], command))]
+                    source_refs = source_references(Path(repo["path"]), details["common_base"], investigation["branch_a"], investigation["branch_b"])
                 run_ids = []
                 for role, run in runs: run_ids.append(self.store.save("test_runs", {"id": str(uuid.uuid4()), "investigation_id": investigation["id"], "role": role, "started_at": now(), **run})["id"])
-                report = {"id": str(uuid.uuid4()), "investigation_id": investigation["id"], "runs": [self.store.find("test_runs", x) for x in run_ids], "summary": {"confirmed": int(runs[0][1]["status"] == "passed" and runs[1][1]["status"] == "passed" and runs[2][1]["status"] == "failed")}, "generated_at": now()}; self.store.save("reports", report); self.store.update("investigations", investigation["id"], status="completed", run_ids=run_ids, report_id=report["id"], completed_at=now()); self.send_json(report); return
+                confirmed = int(runs[0][1]["status"] == "passed" and runs[1][1]["status"] == "passed" and runs[2][1]["status"] == "failed")
+                report = {"id": str(uuid.uuid4()), "investigation_id": investigation["id"], "runs": [self.store.find("test_runs", x) for x in run_ids], "summary": {"confirmed": confirmed, "likely_risks": 0 if confirmed else 1, "suggestions": 0 if confirmed else 1}, "findings": report_findings(bool(confirmed), source_refs), "generated_at": now()}; self.store.save("reports", report); self.store.update("investigations", investigation["id"], status="completed", run_ids=run_ids, report_id=report["id"], completed_at=now()); self.send_json(report); return
             if len(parts) == 4 and parts[:2] == ["api", "investigations"] and parts[3] == "report":
                 if not self.store.find("investigations", parts[2]): raise KeyError("investigation not found")
                 report = {"id": str(uuid.uuid4()), "investigation_id": parts[2], "data": payload, "generated_at": now()}; self.store.save("reports", report); self.send_json(report, 201); return
@@ -232,6 +263,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("127.0.0.1", 8000), Handler); print("MergeProof running at http://localhost:8000")
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler); print(f"MergeProof running at http://localhost:{PORT}")
     try: server.serve_forever()
     except KeyboardInterrupt: server.server_close()
