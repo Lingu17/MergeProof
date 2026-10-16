@@ -4,10 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app import Store, analysis, inspect_repository, run_branch, run_command, run_combined, _confirmed, collection_view, overview
+from app import Store, analysis, inspect_repository, run_branch, run_command, run_combined, _confirmed, collection_view, overview, report_findings
 
 
 class BackendTests(unittest.TestCase):
+    def _init_repo(self, repo):
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        # Test repositories must never depend on a user's global Git config.
+        subprocess.run(["git", "-C", str(repo), "config", "--local", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "--local", "user.name", "Test"], check=True)
+
     def test_store_persists_sample_entry_and_records(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "data.json"
@@ -22,10 +28,10 @@ class BackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             repo.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            self._init_repo(repo)
             (repo / "test_ok.py").write_text("import unittest\nclass T(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(repo), "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-qm", "initial"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
             current = subprocess.check_output(["git", "-C", str(repo), "branch", "--show-current"], text=True).strip()
             subprocess.run(["git", "-C", str(repo), "branch", "change-a"], check=True)
             sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
@@ -37,6 +43,9 @@ class BackendTests(unittest.TestCase):
             result = run_branch(repo, "change-a", "python -m unittest discover -v")
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["exit_code"], 0)
+            remote_result = run_branch(repo, "remote-only", "python -m unittest discover -v")
+            self.assertEqual(remote_result["status"], "passed")
+            self.assertEqual(remote_result["exit_code"], 0)
 
     def test_sample_workflow_keeps_confirmed_semantics(self):
         result = analysis()
@@ -51,7 +60,7 @@ class BackendTests(unittest.TestCase):
             missing = run_command(root, "mergeproof-command-that-does-not-exist")
             timeout = run_command(root, "python -c \"import time; time.sleep(2)\"", timeout=0.05)
         self.assertEqual(failed["status"], "failed")
-        self.assertEqual(failed["result_type"], "test_failure")
+        self.assertEqual(failed["result_type"], "execution_error")
         self.assertEqual(missing["status"], "missing_command")
         self.assertEqual(timeout["status"], "timeout")
         for result in (failed, missing, timeout):
@@ -66,6 +75,22 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(syntax["result_type"], "syntax_error")
         self.assertEqual(dependency["result_type"], "dependency_error")
         self.assertEqual(execution["result_type"], "execution_error")
+
+    def test_assertion_evidence_is_required_for_test_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assertion = run_command(root, "python -c \"raise AssertionError('bad')\"")
+            runtime = run_command(root, "python -c \"raise RuntimeError('bad')\"")
+            runtime_with_assertion_word = run_command(root, "python -c \"raise RuntimeError('AssertionError mentioned as data')\"")
+        self.assertEqual(assertion["result_type"], "test_failure")
+        self.assertEqual(runtime["result_type"], "execution_error")
+        self.assertEqual(runtime_with_assertion_word["result_type"], "execution_error")
+
+    def test_all_passing_findings_do_not_claim_generic_risk(self):
+        runs = [{"status": "passed"}, {"status": "passed"}, {"status": "passed"}]
+        findings = report_findings(False, runs=runs)
+        self.assertEqual(findings[0]["title"], "No conflict detected by these checks")
+        self.assertNotIn("Likely Risk", {finding["classification"] for finding in findings})
 
     def test_store_marks_running_investigations_interrupted_on_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -91,10 +116,10 @@ class BackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             repo.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            self._init_repo(repo)
             (repo / "value.txt").write_text("base\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(repo), "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-qm", "initial"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
             subprocess.run(["git", "-C", str(repo), "branch", "change-a"], check=True)
             subprocess.run(["git", "-C", str(repo), "branch", "change-b"], check=True)
             subprocess.run(["git", "-C", str(repo), "branch", "mergeproof-analysis"], check=True)
@@ -118,10 +143,10 @@ class BackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             repo.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            self._init_repo(repo)
             (repo / "test_ok.py").write_text("import unittest\nclass T(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(repo), "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-qm", "initial"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
             current = subprocess.check_output(["git", "-C", str(repo), "branch", "--show-current"], text=True).strip()
             subprocess.run(["git", "-C", str(repo), "branch", "change-a"], check=True)
             subprocess.run(["git", "-C", str(repo), "branch", "change-b"], check=True)

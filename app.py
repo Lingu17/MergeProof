@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -157,11 +158,14 @@ def classify_failure(log: str, command: str = "") -> str:
         return "syntax_error"
     if any(token in text for token in ("modulenotfounderror", "importerror", "no module named", "command not found")):
         return "dependency_error"
-    if any(token in text for token in ("assertionerror", "failed (failures=", "failed (errors=")):
-        return "test_failure"
-    if not text and any(tool in command.lower() for tool in ("unittest", "pytest", "nose")):
-        return "test_failure"
-    if "sys.exit" in command.lower():
+    # A non-zero process exit is not, by itself, evidence that a test
+    # assertion failed.  In particular, commands that deliberately call
+    # sys.exit() and uncaught RuntimeError/other exceptions are execution
+    # errors.  Only assertion evidence (or unittest's failure summary) can
+    # establish a test failure.
+    assertion_traceback = re.search(r"(?:^|\n)(?:e\s+)?assertionerror(?:\s*:|\s*$)", text)
+    pytest_assertion = re.search(r"(?:^|\n)failed\s+.+\s-\s+assert\b", text)
+    if assertion_traceback or pytest_assertion or "failed (failures=" in text:
         return "test_failure"
     return "execution_error"
 
@@ -175,17 +179,26 @@ def _sha(source: Path, branch: str) -> str:
     return git(source, "rev-parse", _git_ref(source, branch)).stdout.strip()
 
 
-def _clone(source: Path, destination: Path):
+def _clone(source: Path, destination: Path, branches=()):
     result = subprocess.run(["git", "clone", "--no-local", "--no-hardlinks", "--quiet", str(source), str(destination)], capture_output=True, text=True)
     if result.returncode:
         raise ValueError((result.stderr or result.stdout).strip() or "unable to create clean repository snapshot")
+    # A local clone copies refs/heads but not arbitrary refs/remotes/origin.
+    # Fetch the selected refs explicitly so a branch that exists only as a
+    # remote-tracking ref is runnable in the clean snapshot too.
+    for branch in branches:
+        remote_ref = f"refs/remotes/origin/{branch}"
+        if git(source, "rev-parse", "--verify", remote_ref, check=False).returncode == 0:
+            fetched = git(destination, "fetch", "--no-tags", str(source), f"{remote_ref}:{remote_ref}", check=False)
+            if fetched.returncode:
+                raise ValueError((fetched.stderr or fetched.stdout).strip() or f"unable to fetch {remote_ref}")
 
 
 def run_branch(source: Path, branch: str, command: str) -> dict:
     with tempfile.TemporaryDirectory(prefix="mergeproof-") as temporary:
         destination = Path(temporary) / "repo"
         try:
-            _clone(source, destination)
+            _clone(source, destination, (branch,))
             ref = branch if git(destination, "rev-parse", "--verify", f"refs/heads/{branch}", check=False).returncode == 0 else f"origin/{branch}"
             git(destination, "checkout", "--quiet", ref)
             git(destination, "reset", "--hard", ref)
@@ -199,7 +212,7 @@ def run_combined(source: Path, branch_a: str, branch_b: str, base: str, command:
     with tempfile.TemporaryDirectory(prefix="mergeproof-") as temporary:
         destination = Path(temporary) / "repo"
         try:
-            _clone(source, destination)
+            _clone(source, destination, (branch_a, branch_b))
             # Use a detached clean base so an existing source branch named
             # mergeproof-analysis (or any other helper branch) cannot break setup.
             git(destination, "checkout", "--quiet", "--detach", base)
@@ -220,10 +233,12 @@ def run_case(folder: str, test_file: str) -> dict:
     return run_command(ROOT / "demo_repo" / folder, f'{sys.executable} -m unittest -v {test_file}')
 
 
-def report_findings(confirmed: bool, source_refs=None):
+def report_findings(confirmed: bool, source_refs=None, runs=None):
     if confirmed:
         return [{"classification": "Confirmed Conflict", "title": "Combined test failure reproduced", "explanation": "Independent relevant checks passed and the combined relevant check failed; persisted logs and changed-file evidence show the interaction.", "source_refs": source_refs or []}]
-    return [{"classification": "Likely Risk", "title": "No confirmed interaction reproduced", "explanation": "The selected checks did not meet the pass/pass/test-failed rule. Merge conflicts, setup errors, missing commands, timeouts, and test failures are reported separately.", "source_refs": source_refs or []}, {"classification": "Suggested Investigation", "title": "Add or refine a cross-branch regression test", "explanation": "A targeted integration check may be needed to exercise the changed behavior together.", "source_refs": source_refs or []}]
+    if runs and all(run.get("status") == "passed" for run in runs):
+        return [{"classification": "No Conflict", "title": "No conflict detected by these checks", "explanation": "All selected checks passed; these checks did not detect a conflict.", "source_refs": source_refs or []}]
+    return [{"classification": "Suggested Investigation", "title": "No confirmed interaction reproduced", "explanation": "The selected checks did not meet the pass/pass/test-failed rule. Merge conflicts, setup errors, missing commands, timeouts, and test failures are reported separately.", "source_refs": source_refs or []}]
 
 
 def source_references(source: Path, base: str, branch_a: str, branch_b: str):
@@ -314,8 +329,11 @@ def execute_investigation(handler, investigation):
     confirmed = _confirmed(runs)
     report = {"id": str(uuid.uuid4()), "investigation_id": investigation["id"], "execution_id": execution_id, "run_ids": run_ids, "runs": runs,
               "repository": {"repository_id": repo["id"], "branch_a": details.get("branch_a"), "branch_b": details.get("branch_b"), "branch_a_sha": details.get("branch_a_sha"), "branch_b_sha": details.get("branch_b_sha"), "common_base": details.get("common_base")},
-              "summary": {"confirmed": int(confirmed), "likely_risks": 0 if confirmed else 1, "suggestions": 0 if confirmed else 1},
-              "findings": report_findings(confirmed, refs), "generated_at": now()}
+              # A non-confirmed run is not automatically a risk: setup and
+              # execution errors, and an all-green run, provide no interaction
+              # evidence.  Keep the risk count evidence-based.
+              "summary": {"confirmed": int(confirmed), "likely_risks": 0, "suggestions": 0 if confirmed else 1},
+              "findings": report_findings(confirmed, refs, runs), "generated_at": now()}
     store.save("reports", report)
     finished = now()
     store.update("investigations", investigation["id"], status="completed", run_ids=run_ids, report_id=report["id"], latest_execution_id=execution_id, completed_at=finished, finished_at=finished, common_base=details.get("common_base"), branch_a_sha=details.get("branch_a_sha"), branch_b_sha=details.get("branch_b_sha"))
