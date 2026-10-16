@@ -33,10 +33,12 @@ def analysis() -> dict:
         "repo": {"name": "checkout-service", "branch": "mergeproof/demo", "language": "Python 3"},
         "summary": {
             "confirmed": 1 if combined["status"] == "failed" and independent_a["status"] == "passed" and independent_b["status"] == "passed" else 0,
-            "risks": 2,
-            "suggestions": 2,
+            "risks": 1,
+            "suggestions": 1,
             "confidence": 98,
         },
+        "progress": {"completed": 5, "total": 5, "label": "5 of 5 complete"},
+        "graph": {"nodes": 5, "edges": 5},
         "changes": [
             {"id": "change-a", "label": "Change A", "title": "Normalize checkout currency", "author": "Maya Chen", "sha": "a17c9e2", "files": 2, "description": "Moves currency normalization into the order boundary so downstream totals always use USD.", "color": "violet"},
             {"id": "change-b", "label": "Change B", "title": "Add loyalty discount", "author": "Jon Bell", "sha": "b82fd11", "files": 2, "description": "Applies a member discount using the checkout subtotal before tax is calculated.", "color": "cyan"},
@@ -47,9 +49,9 @@ def analysis() -> dict:
             "severity": "High confidence",
             "why": "Change A creates the normalized USD value in `total_usd`. Change B still calculates its 10% discount from the pre-normalized `subtotal`, so the combined test returns 98.0 instead of the expected 97.2.",
             "evidence": [
-                {"kind": "Change A", "file": "demo_repo/combined/service.py", "line": "12", "code": "order['total_usd'] = round(order['subtotal'] * rate, 2)"},
-                {"kind": "Change B", "file": "demo_repo/combined/service.py", "line": "18", "code": "discount = order['subtotal'] * 0.10"},
-                {"kind": "Test evidence", "file": "demo_repo/combined/test_combined.py", "line": "9", "code": "self.assertEqual(checkout({'subtotal': 100, 'currency': 'EUR'}), 99.0)"},
+                {"kind": "Change A", "file": "demo_repo/combined/service.py", "line": "3", "code": "order['total_usd'] = round(order['subtotal'] * rates[order['currency']], 2)"},
+                {"kind": "Change B", "file": "demo_repo/combined/service.py", "line": "4", "code": "discount = order['subtotal'] * 0.10 if order.get('loyalty') else 0"},
+                {"kind": "Test evidence", "file": "demo_repo/combined/test_combined.py", "line": "7", "code": "self.assertEqual(checkout({'subtotal': 100, 'currency': 'EUR', 'loyalty': True}), 97.2)"},
             ],
             "trace": ["Order subtotal", "Normalize to total_usd", "Apply loyalty discount", "Checkout assertion"],
         },
