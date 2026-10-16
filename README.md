@@ -10,6 +10,8 @@ python app.py
 
 Open http://localhost:8000. The dashboard runs a real Python fixture analysis: Change A and Change B each pass their own tests, while the combined snapshot reproduces a failing integration test.
 
+The server binds to `0.0.0.0` so a published Docker port is reachable. The image installs Git because real repository investigations clone clean Git snapshots.
+
 The backend stores repositories, investigations, test runs, and reports in `mergeproof-data.json` beside `app.py`. Set `MERGEPROOF_DATA_FILE` to use another local JSON file. The built-in `checkout-service (sample)` repository is retained as a clearly labeled sample record whenever a new store is created.
 
 ## API
@@ -28,3 +30,5 @@ The report marks `summary.confirmed` only when independent A passes, independent
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+The project is released under the MIT License (`LICENSE`).
