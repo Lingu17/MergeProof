@@ -4,5 +4,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . .
+ENV MERGEPROOF_BIND_HOST=0.0.0.0
 EXPOSE 8000
 CMD ["python", "app.py"]

@@ -100,17 +100,49 @@ class BackendTests(unittest.TestCase):
             restarted = Store(path)
         self.assertEqual(restarted.find("investigations", "running")["status"], "interrupted")
 
+    def test_corrupt_storage_is_preserved_and_recovery_is_actionable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.json"
+            original = b'{"repositories": [broken'
+            path.write_bytes(original)
+            with self.assertRaisesRegex(RuntimeError, "corrupted.*backup") as raised:
+                Store(path)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(path.with_name("data.json.corrupt-backup").read_bytes(), original)
+            self.assertIn("restore", str(raised.exception))
+
+    def test_collection_status_filter_and_zero_test_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "data.json")
+            store.save("investigations", {"id": "done", "status": "completed"})
+            store.save("investigations", {"id": "new", "status": "created"})
+            result = collection_view(store, "investigations", {"status": ["completed"]})
+            zero = run_command(Path(directory), "python -c \"print('Ran 0 tests')\"")
+        self.assertEqual([item["id"] for item in result["investigations"]], ["done"])
+        self.assertEqual(zero["test_count"], 0)
+        self.assertTrue(zero["zero_tests"])
+
+    def test_confirmation_requires_tests_to_have_run(self):
+        runs = [{"role": "independent_a", "status": "passed", "test_count": 0},
+                {"role": "independent_b", "status": "passed", "test_count": 1},
+                {"role": "combined", "status": "failed", "result_type": "test_failure", "test_count": 1, "log": "assert"}]
+        self.assertFalse(_confirmed(runs))
+
     def test_overview_and_collection_view_support_counts_search_and_pagination(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / "data.json")
             store.save("investigations", {"id": "one", "status": "completed", "created_at": "2026-01-01"})
             store.save("investigations", {"id": "two", "status": "created", "created_at": "2026-01-02"})
+            finding = {"classification": "Confirmed Conflict", "title": "same", "source_refs": [{"file": "service.py", "sha": "abc"}]}
+            store.save("reports", {"id": "r1", "summary": {"confirmed": 1}, "findings": [finding]})
+            store.save("reports", {"id": "r2", "summary": {"confirmed": 1}, "findings": [finding]})
             result = collection_view(store, "investigations", {"search": ["one"], "page": ["1"], "page_size": ["1"]})
             dashboard = overview(store)
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["investigations"][0]["id"], "one")
         self.assertEqual(dashboard["counts"]["investigations"], 2)
         self.assertEqual(dashboard["counts"]["completed"], 1)
+        self.assertEqual(dashboard["unique_confirmed_findings"], 1)
 
     def test_same_branch_is_rejected_and_merge_conflict_is_not_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -153,6 +185,29 @@ class BackendTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "branch", "mergeproof-analysis"], check=True)
             base = subprocess.check_output(["git", "-C", str(repo), "merge-base", "change-a", "change-b"], text=True).strip()
             (repo / "untracked.txt").write_text("must not enter snapshot", encoding="utf-8")
+            result = run_combined(repo, "change-a", "change-b", base, "python -m unittest discover -v")
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["result_type"], "passed")
+
+    def test_different_commits_merge_without_global_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            self._init_repo(repo)
+            (repo / "test_ok.py").write_text("import unittest\nclass T(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+            subprocess.run(["git", "-C", str(repo), "branch", "change-a"], check=True)
+            subprocess.run(["git", "-C", str(repo), "branch", "change-b"], check=True)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-q", "change-a"], check=True)
+            (repo / "a.txt").write_text("A\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "change A"], check=True)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-q", "change-b"], check=True)
+            (repo / "b.txt").write_text("B\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "change B"], check=True)
+            base = subprocess.check_output(["git", "-C", str(repo), "merge-base", "change-a", "change-b"], text=True).strip()
             result = run_combined(repo, "change-a", "change-b", base, "python -m unittest discover -v")
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["result_type"], "passed")

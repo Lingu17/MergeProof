@@ -5,12 +5,14 @@ MergeProof is an evidence-first demo for finding bugs that only appear when two 
 ## Run it
 
 ```bash
+cp .env.example .env  # optional; edit values, then export them in your shell
+set -a; . ./.env; set +a
 python app.py
 ```
 
 Open http://localhost:8000. The dashboard runs a real Python fixture analysis: Change A and Change B each pass their own tests, while the combined snapshot reproduces a failing integration test.
 
-The server binds to `0.0.0.0` so a published Docker port is reachable. The image installs Git because real repository investigations clone clean Git snapshots.
+The local server binds to `127.0.0.1` by default. Set `MERGEPROOF_BIND_HOST` when a different interface is required. The image installs Git because real repository investigations clone clean Git snapshots.
 
 The backend stores repositories, investigations, test runs, and reports in `mergeproof-data.json` beside `app.py`. Set `MERGEPROOF_DATA_FILE` to use another local JSON file. The built-in `checkout-service (sample)` repository is retained as a clearly labeled sample record whenever a new store is created.
 
@@ -30,6 +32,17 @@ The report marks `summary.confirmed` only when independent A passes, independent
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## Docker
+
+Build and run with an explicit container exposure setting:
+
+```bash
+docker build -t mergeproof .
+docker run --rm -p 8000:8000 -e MERGEPROOF_BIND_HOST=0.0.0.0 mergeproof
+```
+
+The Docker image sets `MERGEPROOF_BIND_HOST=0.0.0.0` because published ports need an in-container listener; the host-only default remains in effect for direct local runs. Use a volume if investigation data must persist, for example `-v "$PWD/data:/app/data" -e MERGEPROOF_DATA_FILE=/app/data/mergeproof-data.json`.
 
 The project is released under the MIT License (`LICENSE`).
 

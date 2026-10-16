@@ -1,0 +1,9 @@
+.git
+.gitignore
+__pycache__/
+.pytest_cache/
+*.pyc
+mergeproof-data.json
+*.corrupt-backup
+tests/
+demo_repo/*/__pycache__/

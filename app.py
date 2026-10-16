@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).parent
 DATA_FILE = Path(os.environ.get("MERGEPROOF_DATA_FILE", ROOT / "mergeproof-data.json"))
 PORT = int(os.environ.get("MERGEPROOF_PORT", "8000"))
+BIND_HOST = os.environ.get("MERGEPROOF_BIND_HOST", "127.0.0.1")
 DEFAULT_COMMAND = "python -m unittest discover -v"
 SAMPLE_COMMAND = "Built-in sample checks (fixed)"
 API_VERSION = "2026.10.1"
@@ -44,10 +45,17 @@ class Store:
         if self.path.exists():
             try:
                 value = json.loads(self.path.read_text(encoding="utf-8"))
-                if isinstance(value, dict):
-                    return {key: value.get(key, []) for key in ("repositories", "investigations", "test_runs", "reports")}
-            except (OSError, json.JSONDecodeError):
-                pass
+                collections = ("repositories", "investigations", "test_runs", "reports")
+                if isinstance(value, dict) and all(isinstance(value.get(key, []), list) for key in collections):
+                    return {key: value.get(key, []) for key in collections}
+                raise ValueError("top-level value must be an object containing array collections")
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                backup = self.path.with_name(self.path.name + ".corrupt-backup")
+                try:
+                    shutil.copy2(self.path, backup)
+                except OSError as backup_exc:
+                    raise RuntimeError(f"storage file is corrupted ({exc}); original could not be backed up: {backup_exc}") from exc
+                raise RuntimeError(f"storage file is corrupted ({exc}); original preserved at {self.path}. Back up or remove it, then restore from {backup} if needed") from exc
         sample = {"id": "sample", "name": "checkout-service (sample)", "path": str(ROOT / "demo_repo"),
                   "sample": True, "valid": True, "created_at": now()}
         result = {"repositories": [sample], "investigations": [], "test_runs": [], "reports": []}
@@ -97,8 +105,15 @@ def validate_repository(path: str) -> dict:
     git(location, "rev-parse", "--is-inside-work-tree")
     # Include branches that exist only on a remote-tracking ref.  They are
     # valid investigation inputs even when the working copy has no local head.
-    branches = git(location, "for-each-ref", "refs/heads", "refs/remotes", "--format=%(refname:short)").stdout.splitlines()
-    branches = sorted({b[7:] if b.startswith("origin/") else b for b in branches if b != "origin/HEAD"})
+    branches = git(location, "for-each-ref", "refs/heads", "refs/remotes", "--format=%(refname)").stdout.splitlines()
+    normalized = set()
+    for ref in branches:
+        if ref == "refs/remotes/origin/HEAD" or ref.endswith("/HEAD"):
+            continue
+        name = ref.removeprefix("refs/heads/").removeprefix("refs/remotes/origin/")
+        if name and name != "HEAD":
+            normalized.add(name)
+    branches = sorted(normalized)
     head = git(location, "branch", "--show-current", check=False).stdout.strip() or "HEAD"
     return {"path": str(location), "valid": True, "head": head, "head_sha": git(location, "rev-parse", "HEAD").stdout.strip(), "branches": branches,
             "name": location.name, "checked_at": now()}
@@ -107,6 +122,8 @@ def validate_repository(path: str) -> dict:
 def inspect_repository(repo: dict, branch_a=None, branch_b=None) -> dict:
     info = validate_repository(repo["path"])
     info["repository_id"] = repo["id"]
+    if (branch_a is not None and (not isinstance(branch_a, str) or not branch_a.strip())) or (branch_b is not None and (not isinstance(branch_b, str) or not branch_b.strip())):
+        raise ValueError("branch_a and branch_b must be non-empty strings")
     if branch_a and branch_b:
         if branch_a == branch_b:
             raise ValueError("branch_a and branch_b must be different branches")
@@ -129,27 +146,39 @@ def _output(exc_or_out) -> str:
     return str(value)
 
 
+def _test_evidence(log: str) -> dict:
+    names = sorted(set(re.findall(r"(?:^|\s)(test_[A-Za-z0-9_]+)(?:\s|$)", log or "")))
+    match = re.search(r"Ran\s+(\d+)\s+tests?", log or "", re.I)
+    if match:
+        count = int(match.group(1))
+    else:
+        passed = re.search(r"(\d+)\s+passed", log or "", re.I)
+        failed = re.search(r"(\d+)\s+failed", log or "", re.I)
+        count = (int(passed.group(1)) if passed else 0) + (int(failed.group(1)) if failed else 0)
+    return {"test_names": names, "test_count": count, "zero_tests": count == 0}
+
+
 def run_command(cwd: Path, command: str, timeout: int = 300) -> dict:
     started = now()
     try:
         args = [arg.strip('"') if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "\"'" else arg
                 for arg in shlex.split(command, posix=False)]
         if not args:
-            return {"command": command, "status": "missing_command", "exit_code": -1, "log": "No command was supplied.", "full_log": "No command was supplied.", "started_at": started, "finished_at": now()}
+            return {"command": command, "status": "missing_command", "exit_code": -1, "log": "No command was supplied.", "full_log": "No command was supplied.", **_test_evidence(""), "started_at": started, "finished_at": now()}
         result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
         log = (result.stdout + result.stderr).strip()
         status = "passed" if result.returncode == 0 else "failed"
         result_type = "passed" if result.returncode == 0 else classify_failure(log, command)
-        return {"command": command, "status": status, "result_type": result_type, "exit_code": result.returncode, "output": log, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
+        return {"command": command, "status": status, "result_type": result_type, "exit_code": result.returncode, "output": log, "log": log, "full_log": log, **_test_evidence(log), "started_at": started, "finished_at": now()}
     except subprocess.TimeoutExpired as exc:
         log = (_output(exc.stdout) + _output(exc.stderr)).strip() or f"Command timed out after {timeout} seconds."
-        return {"command": command, "status": "timeout", "result_type": "execution_error", "exit_code": -1, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
+        return {"command": command, "status": "timeout", "result_type": "execution_error", "exit_code": -1, "log": log, "full_log": log, **_test_evidence(log), "started_at": started, "finished_at": now()}
     except FileNotFoundError as exc:
         log = f"Command not found: {args[0] if 'args' in locals() and args else command} ({exc})"
-        return {"command": command, "status": "missing_command", "result_type": "dependency_error", "exit_code": -1, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
+        return {"command": command, "status": "missing_command", "result_type": "dependency_error", "exit_code": -1, "log": log, "full_log": log, **_test_evidence(log), "started_at": started, "finished_at": now()}
     except (OSError, ValueError) as exc:
         log = str(exc)
-        return {"command": command, "status": "setup_error", "result_type": "execution_error", "exit_code": -1, "log": log, "full_log": log, "started_at": started, "finished_at": now()}
+        return {"command": command, "status": "setup_error", "result_type": "execution_error", "exit_code": -1, "log": log, "full_log": log, **_test_evidence(log), "started_at": started, "finished_at": now()}
 
 
 def classify_failure(log: str, command: str = "") -> str:
@@ -183,24 +212,28 @@ def _clone(source: Path, destination: Path, branches=()):
     result = subprocess.run(["git", "clone", "--no-local", "--no-hardlinks", "--quiet", str(source), str(destination)], capture_output=True, text=True)
     if result.returncode:
         raise ValueError((result.stderr or result.stdout).strip() or "unable to create clean repository snapshot")
-    # A local clone copies refs/heads but not arbitrary refs/remotes/origin.
-    # Fetch the selected refs explicitly so a branch that exists only as a
-    # remote-tracking ref is runnable in the clean snapshot too.
+    # Materialize selected remote-only commits under private refs. Never fetch
+    # into refs/remotes/origin/*: that can reject when a stale remote ref is
+    # older than a newer local branch. Execution uses exact commit SHAs.
     for branch in branches:
         remote_ref = f"refs/remotes/origin/{branch}"
         if git(source, "rev-parse", "--verify", remote_ref, check=False).returncode == 0:
-            fetched = git(destination, "fetch", "--no-tags", str(source), f"{remote_ref}:{remote_ref}", check=False)
+            sha = git(source, "rev-parse", remote_ref).stdout.strip()
+            private_ref = f"refs/mergeproof/{branch.replace('..', '_')}"
+            fetched = git(destination, "fetch", "--no-tags", str(source), f"+{sha}:{private_ref}", check=False)
             if fetched.returncode:
                 raise ValueError((fetched.stderr or fetched.stdout).strip() or f"unable to fetch {remote_ref}")
 
 
-def run_branch(source: Path, branch: str, command: str) -> dict:
+def run_branch(source: Path, branch: str, command: str, commit_sha: str = None) -> dict:
     with tempfile.TemporaryDirectory(prefix="mergeproof-") as temporary:
         destination = Path(temporary) / "repo"
         try:
             _clone(source, destination, (branch,))
-            ref = branch if git(destination, "rev-parse", "--verify", f"refs/heads/{branch}", check=False).returncode == 0 else f"origin/{branch}"
-            git(destination, "checkout", "--quiet", ref)
+            ref = commit_sha or _sha(source, branch)
+            git(destination, "config", "user.name", "MergeProof Temporary")
+            git(destination, "config", "user.email", "mergeproof@localhost")
+            git(destination, "checkout", "--quiet", "--detach", ref)
             git(destination, "reset", "--hard", ref)
             git(destination, "clean", "-fdx")
         except (ValueError, OSError) as exc:
@@ -208,7 +241,7 @@ def run_branch(source: Path, branch: str, command: str) -> dict:
         return run_command(destination, command)
 
 
-def run_combined(source: Path, branch_a: str, branch_b: str, base: str, command: str) -> dict:
+def run_combined(source: Path, branch_a: str, branch_b: str, base: str, command: str, sha_a: str = None, sha_b: str = None) -> dict:
     with tempfile.TemporaryDirectory(prefix="mergeproof-") as temporary:
         destination = Path(temporary) / "repo"
         try:
@@ -216,14 +249,15 @@ def run_combined(source: Path, branch_a: str, branch_b: str, base: str, command:
             # Use a detached clean base so an existing source branch named
             # mergeproof-analysis (or any other helper branch) cannot break setup.
             git(destination, "checkout", "--quiet", "--detach", base)
-            def merge_ref(branch):
-                local = git(destination, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
-                return branch if local.returncode == 0 else f"origin/{branch}"
-            merge = git(destination, "merge", "--no-commit", "--no-ff", merge_ref(branch_a), merge_ref(branch_b), check=False)
+            git(destination, "config", "user.name", "MergeProof Temporary")
+            git(destination, "config", "user.email", "mergeproof@localhost")
+            merge = git(destination, "merge", "--no-commit", "--no-ff", sha_a or _sha(source, branch_a), sha_b or _sha(source, branch_b), check=False)
             if merge.returncode:
                 log = (merge.stdout + merge.stderr).strip()
                 git(destination, "merge", "--abort", check=False)
-                return {"command": command, "status": "merge_conflict", "exit_code": merge.returncode, "log": "Merge conflict before tests\n" + log, "full_log": "Merge conflict before tests\n" + log, "started_at": now(), "finished_at": now()}
+                conflict = "CONFLICT" in log.upper() or "Automatic merge failed" in log
+                status = "merge_conflict" if conflict else "setup_error"
+                return {"command": command, "status": status, "result_type": "merge_conflict" if conflict else "execution_error", "exit_code": merge.returncode, "log": ("Merge conflict before tests\n" if conflict else "Merge setup failed before tests\n") + log, "full_log": log, **_test_evidence(log), "started_at": now(), "finished_at": now()}
         except (ValueError, OSError) as exc:
             return {"command": command, "status": "setup_error", "result_type": "execution_error", "exit_code": -1, "log": str(exc), "full_log": str(exc), "started_at": now(), "finished_at": now()}
         return run_command(destination, command)
@@ -241,10 +275,10 @@ def report_findings(confirmed: bool, source_refs=None, runs=None):
     return [{"classification": "Suggested Investigation", "title": "No confirmed interaction reproduced", "explanation": "The selected checks did not meet the pass/pass/test-failed rule. Merge conflicts, setup errors, missing commands, timeouts, and test failures are reported separately.", "source_refs": source_refs or []}]
 
 
-def source_references(source: Path, base: str, branch_a: str, branch_b: str):
+def source_references(source: Path, base: str, branch_a: str, branch_b: str, sha_a: str = None, sha_b: str = None):
     references = []
-    for label, branch in (("Change A", branch_a), ("Change B", branch_b)):
-        ref = _git_ref(source, branch)
+    for label, branch, selected_sha in (("Change A", branch_a, sha_a), ("Change B", branch_b, sha_b)):
+        ref = selected_sha or _sha(source, branch)
         diff = git(source, "diff", "--unified=3", f"{base}..{ref}", "--", check=False)
         text = (diff.stdout or diff.stderr).strip()
         snippets = []
@@ -253,13 +287,13 @@ def source_references(source: Path, base: str, branch_a: str, branch_b: str):
             content = git(source, "show", f"{ref}:{name}", check=False).stdout
             if content:
                 snippets.append({"file": name, "text": content[:6000]})
-        references.append({"kind": label, "branch": branch, "sha": _sha(source, branch), "command": f"git diff --unified=3 {base[:12]}..{branch}", "text": text[:12000] or "No textual diff available.", "snippets": snippets})
+        references.append({"kind": label, "branch": branch, "sha": ref, "command": f"git diff --unified=3 {base[:12]}..{ref}", "text": text[:12000] or "No textual diff available.", "snippets": snippets})
     return references
 
 
 def analysis() -> dict:
     independent_a, independent_b, combined = run_case("change_a", "test_change_a.py"), run_case("change_b", "test_change_b.py"), run_case("combined", "test_combined.py")
-    confirmed = independent_a["status"] == "passed" and independent_b["status"] == "passed" and combined["status"] == "failed" and combined.get("result_type") == "test_failure" and bool(combined.get("log"))
+    confirmed = _confirmed([{"role": "independent_a", **independent_a}, {"role": "independent_b", **independent_b}, {"role": "combined", **combined}])
     evidence = [{"kind": "Change A", "file": "demo_repo/combined/service.py", "line": "3", "code": "order['total_usd'] = round(order['subtotal'] * rates[order['currency']], 2)"}, {"kind": "Change B", "file": "demo_repo/combined/service.py", "line": "4", "code": "discount = order['subtotal'] * 0.10 if order.get('loyalty') else 0"}, {"kind": "Test evidence", "file": "demo_repo/combined/test_combined.py", "line": "7", "code": "self.assertEqual(checkout({'subtotal': 100, 'currency': 'EUR', 'loyalty': True}), 97.2)"}]
     return {"repo": {"name": "checkout-service", "branch": "mergeproof/demo", "language": "Python 3"}, "summary": {"confirmed": int(confirmed), "risks": 1, "suggestions": 1, "confidence": 98}, "progress": {"completed": 5, "total": 5, "label": "5 of 5 complete"}, "graph": {"nodes": 5, "edges": 5}, "changes": [], "tests": {"change_a": independent_a, "change_b": independent_b, "combined": combined}, "finding": {"title": "Discount is calculated against the pre-normalized subtotal", "severity": "High confidence", "why": "Change A creates the normalized USD value in `total_usd`. Change B still calculates its 10% discount from the pre-normalized `subtotal`, so the combined test fails while each independent test passes.", "evidence": evidence, "trace": ["Order subtotal", "Normalize to total_usd", "Apply loyalty discount", "Checkout assertion"]}, "generated_at": "Live run · local Python subprocess"}
 
@@ -267,7 +301,8 @@ def analysis() -> dict:
 def _confirmed(runs):
     by_role = {run["role"]: run for run in runs}
     # A merge conflict is not a test result and can never confirm an interaction.
-    return (by_role.get("independent_a", {}).get("status") == "passed" and
+    comparable = all(by_role.get(role, {}).get("test_count", 0) > 0 for role in ("independent_a", "independent_b", "combined"))
+    return (comparable and by_role.get("independent_a", {}).get("status") == "passed" and
             by_role.get("independent_b", {}).get("status") == "passed" and
             by_role.get("combined", {}).get("status") == "failed" and
             by_role.get("combined", {}).get("result_type") == "test_failure" and
@@ -279,6 +314,9 @@ def collection_view(store, collection, query):
     search = (query.get("search", [""])[0] or "").lower()
     if search:
         items = [item for item in items if search in json.dumps(item).lower()]
+    statuses = [status.strip() for value in query.get("status", []) for status in value.split(",") if status.strip()]
+    if statuses:
+        items = [item for item in items if item.get("status") in statuses]
     try:
         page = max(1, int(query.get("page", ["1"])[0]))
         size = min(100, max(1, int(query.get("page_size", ["50"])[0])))
@@ -290,8 +328,15 @@ def collection_view(store, collection, query):
 
 def overview(store):
     investigations = store.data["investigations"]
-    confirmed = sum(bool(r.get("summary", {}).get("confirmed")) for r in store.data["reports"])
-    return {"api_version": API_VERSION, "counts": {"repositories": len(store.data["repositories"]), "investigations": len(investigations), "test_runs": len(store.data["test_runs"]), "reports": len(store.data["reports"]), "completed": sum(i.get("status") == "completed" for i in investigations), "running": sum(i.get("status") == "running" for i in investigations)}, "confirmed_findings": confirmed, "recent_activity": sorted(investigations, key=lambda x: x.get("created_at", ""), reverse=True)[:10]}
+    unique = set()
+    for report in store.data["reports"]:
+        if not report.get("summary", {}).get("confirmed"):
+            continue
+        for finding in report.get("findings", []):
+            if finding.get("classification") == "Confirmed Conflict":
+                refs = finding.get("source_refs", [])
+                unique.add((finding.get("title"), tuple((ref.get("file"), ref.get("sha"), ref.get("line")) for ref in refs)))
+    return {"api_version": API_VERSION, "counts": {"repositories": len(store.data["repositories"]), "investigations": len(investigations), "test_runs": len(store.data["test_runs"]), "reports": len(store.data["reports"]), "completed": sum(i.get("status") == "completed" for i in investigations), "running": sum(i.get("status") == "running" for i in investigations)}, "confirmed_findings": len(unique), "unique_confirmed_findings": len(unique), "recent_activity": sorted(investigations, key=lambda x: x.get("created_at", ""), reverse=True)[:10]}
 
 
 def execute_investigation(handler, investigation):
@@ -312,10 +357,10 @@ def execute_investigation(handler, investigation):
         refs = sample["finding"].get("evidence", [])
     else:
         source = Path(repo["path"])
-        results = [("independent_a", lambda: run_branch(source, investigation["branch_a"], command)),
-                   ("independent_b", lambda: run_branch(source, investigation["branch_b"], command)),
-                   ("combined", lambda: run_combined(source, investigation["branch_a"], investigation["branch_b"], details["common_base"], command))]
-        refs = source_references(source, details["common_base"], investigation["branch_a"], investigation["branch_b"])
+        results = [("independent_a", lambda: run_branch(source, investigation["branch_a"], command, details["branch_a_sha"])),
+                   ("independent_b", lambda: run_branch(source, investigation["branch_b"], command, details["branch_b_sha"])),
+                   ("combined", lambda: run_combined(source, investigation["branch_a"], investigation["branch_b"], details["common_base"], command, details["branch_a_sha"], details["branch_b_sha"]))]
+        refs = source_references(source, details["common_base"], investigation["branch_a"], investigation["branch_b"], details["branch_a_sha"], details["branch_b_sha"])
     execution_id = str(uuid.uuid4())
     run_ids = []
     for role, result in results:
@@ -350,7 +395,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def body(self):
         length = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(length) or b"{}")
+        value = json.loads(self.rfile.read(length) or b"{}")
+        if not isinstance(value, dict):
+            raise ValueError("JSON request body must be an object")
+        return value
 
     def do_GET(self):  # noqa: N802
         parsed = urlparse(self.path); parts = [p for p in parsed.path.split("/") if p]; query = parse_qs(parsed.query)
@@ -412,12 +460,21 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path); parts = [p for p in parsed.path.split("/") if p]
         try:
             payload = self.body()
-            if parsed.path == "/api/repositories/validate": self.send_json(validate_repository(payload["path"])); return
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            if parsed.path == "/api/repositories/validate":
+                if not isinstance(payload.get("path"), str) or not payload["path"].strip(): raise ValueError("path must be a non-empty string")
+                self.send_json(validate_repository(payload["path"])); return
             if parsed.path == "/api/repositories":
+                if not isinstance(payload.get("path"), str) or not payload["path"].strip(): raise ValueError("path must be a non-empty string")
                 info = validate_repository(payload["path"]); item = {"id": str(uuid.uuid4()), **info, "sample": False, "created_at": now()}; self.store.save("repositories", item); self.send_json(item, 201); return
             if parsed.path == "/api/investigations":
+                if not isinstance(payload.get("repository_id"), str) or not isinstance(payload.get("branch_a"), str) or not isinstance(payload.get("branch_b"), str):
+                    raise ValueError("repository_id, branch_a, and branch_b must be strings")
                 repo = self.store.find("repositories", payload["repository_id"])
                 if not repo: raise KeyError("repository not found")
+                for key in ("branch_a", "branch_b"):
+                    if not isinstance(payload.get(key), str) or not payload[key].strip(): raise ValueError(f"{key} must be a non-empty string")
                 if payload["branch_a"] == payload["branch_b"]: raise ValueError("branch_a and branch_b must be different branches")
                 inspect_repository(repo, payload["branch_a"], payload["branch_b"])
                 requested_command = payload.get("test_command", DEFAULT_COMMAND)
@@ -453,6 +510,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler); print(f"MergeProof running at http://localhost:{PORT}")
+    server = ThreadingHTTPServer((BIND_HOST, PORT), Handler); print(f"MergeProof running at http://{BIND_HOST}:{PORT}")
     try: server.serve_forever()
     except KeyboardInterrupt: server.server_close()
