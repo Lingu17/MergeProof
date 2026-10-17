@@ -22,9 +22,38 @@ jobs:
           -e GIT_CONFIG_GLOBAL=/dev/null -e GIT_CONFIG_NOSYSTEM=1
           mergeproof python -m unittest discover -s tests -v
       - name: Run the server and check its HTTP health
+        id: health
         run: |
-          docker run -d --name mergeproof-smoke -p 127.0.0.1:18000:8000 mergeproof
+          set +e
+          docker run -d \
+            --name mergeproof-smoke \
+            -e MERGEPROOF_BIND_HOST=0.0.0.0 \
+            -e MERGEPROOF_PORT=8000 \
+            -p 127.0.0.1:18000:8000 \
+            mergeproof
+          start_status=$?
+          if [ "$start_status" -ne 0 ]; then
+            echo "Container failed to start; preserving docker run exit status: $start_status"
+            docker ps -a --no-trunc || true
+            docker inspect --format '{{json .State}}' mergeproof-smoke 2>&1 || true
+            docker port mergeproof-smoke 2>&1 || true
+            docker logs mergeproof-smoke 2>&1 || true
+            exit "$start_status"
+          fi
           curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:18000/api/health
+          health_status=$?
+          if [ "$health_status" -ne 0 ]; then
+            echo "Health check failed; preserving curl exit status: $health_status"
+            echo "Container list:"
+            docker ps -a --no-trunc || true
+            echo "Container state:"
+            docker inspect --format '{{json .State}}' mergeproof-smoke 2>&1 || true
+            echo "Port mappings:"
+            docker port mergeproof-smoke 2>&1 || true
+            echo "Full container logs:"
+            docker logs mergeproof-smoke 2>&1 || true
+          fi
+          exit "$health_status"
       - name: Show server logs and clean up
         if: always()
         run: |
