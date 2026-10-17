@@ -5,3 +5,7 @@ __pycache__/
 mergeproof-data.json
 *.log
 *.tmp
+.env
+.env.*
+!.env.example
+data/

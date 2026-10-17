@@ -2,13 +2,29 @@
 
 MergeProof is an evidence-first demo for finding bugs that only appear when two individually passing code changes are combined.
 
+## Requirements
+
+- Python **3.11.17**, pinned in `.python-version` and the Docker image.
+- Git on your PATH. No personal Git identity is needed for temporary executions.
+- Docker Engine/Desktop for the clean Linux rebuild below.
+
+There are no third-party Python packages. `requirements.lock` is intentionally empty apart from comments; it locks the complete Python dependency set. The image installs Git as an OS package. The Python base image is pinned by tag and content digest; Debian package mirrors are still used at build time, so internet access is required for a fresh build. Tests do not require internet access.
+
+Clone the public source:
+
+```bash
+git clone https://github.com/Lingu17/MergeProof.git
+cd MergeProof
+```
+
 ## Run it
 
 ```bash
-cp .env.example .env  # optional; edit values, then export them in your shell
-set -a; . ./.env; set +a
+python -m pip install --no-index --require-hashes -r requirements.lock
 python app.py
 ```
+
+These two commands also work in PowerShell. The default configuration needs no `.env` file. Optional settings are documented in `.env.example`; the app reads environment variables, not `.env` files automatically. In Bash, load overrides with `cp .env.example .env`, then `set -a; . ./.env; set +a`. In PowerShell, set individual variables, for example `$env:MERGEPROOF_PORT = '8765'` before running the app. Do not commit real secrets.
 
 Open http://localhost:8000. The dashboard runs a real Python fixture analysis: Change A and Change B each pass their own tests, while the combined snapshot reproduces a failing integration test.
 
@@ -39,27 +55,31 @@ Build and run with an explicit container exposure setting:
 
 ```bash
 docker build -t mergeproof .
-docker run --rm -p 8000:8000 -e MERGEPROOF_BIND_HOST=0.0.0.0 mergeproof
+docker run --rm -p 127.0.0.1:8000:8000 -v mergeproof-data:/data mergeproof
 ```
 
-The Docker image sets `MERGEPROOF_BIND_HOST=0.0.0.0` because published ports need an in-container listener; the host-only default remains in effect for direct local runs. Use a volume if investigation data must persist, for example `-v "$PWD/data:/app/data" -e MERGEPROOF_DATA_FILE=/app/data/mergeproof-data.json`.
+Open http://localhost:8000. The named volume preserves investigations when the container is recreated. Stop the foreground server with Ctrl+C. The Docker image listens on `0.0.0.0` inside its container; the published port above is limited to host localhost. Container data lives at `/data/mergeproof-data.json`; direct local runs retain the local default. `/app` and `/data` are portable container paths, not paths from a developer's machine.
 
 Run the offline regression suite inside the image with:
 
 ```bash
-docker run --network=none --rm mergeproof python -m unittest discover -s tests -v
+docker run --rm --network none -e GIT_CONFIG_GLOBAL=/dev/null -e GIT_CONFIG_NOSYSTEM=1 mergeproof python -m unittest discover -s tests -v
 ```
+
+This is the same test command used locally. The container flags disable network access and personal/system Git configuration. The deliberately failing sample fixture is expected to fail *inside its investigation*; the regression suite itself must finish with `OK` and exit code zero.
+
+The [Linux rebuild workflow](https://github.com/Lingu17/MergeProof/actions/workflows/rebuild.yml) builds the image on an Ubuntu runner, runs the offline test command above, and checks `/api/health` on a running container. A documented Dockerfile alone is not proof of a successful run; inspect the workflow result for the submitted commit.
 
 To analyze a host repository, mount it read-only into the container and use the mounted path in the Repositories screen, for example:
 
 ```bash
-docker run --rm -p 8000:8000 \
-  -e MERGEPROOF_BIND_HOST=0.0.0.0 \
+docker run --rm -p 127.0.0.1:8000:8000 \
   -v "$PWD/my-repository:/repos/my-repository:ro" \
-  -v "$PWD/data:/app/data" \
-  -e MERGEPROOF_DATA_FILE=/app/data/mergeproof-data.json \
+  -v mergeproof-data:/data \
   mergeproof
 ```
+
+Use `/repos/my-repository` in the UI. The example assumes `my-repository` exists beneath your current folder; replace that relative location with your own checkout. Read-only mounting protects the source checkout, but repository tests still execute code with the container's privileges. Only run trusted repositories. Hosted accounts and public multi-user execution are outside this prototype's scope.
 
 The project is released under the MIT License (`LICENSE`).
 

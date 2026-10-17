@@ -1,1 +1,3 @@
 # No third-party dependencies.
+# This intentionally empty pip requirements file is the complete dependency lock.
+# Install offline with: python -m pip install --no-index --require-hashes -r requirements.lock

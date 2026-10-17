@@ -1,0 +1,32 @@
+name: Linux rebuild and offline tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build the Linux image
+        run: docker build --pull -t mergeproof .
+      - name: Test without network or personal Git settings
+        run: >-
+          docker run --rm --network none
+          -e GIT_CONFIG_GLOBAL=/dev/null -e GIT_CONFIG_NOSYSTEM=1
+          mergeproof python -m unittest discover -s tests -v
+      - name: Run the server and check its HTTP health
+        run: |
+          docker run -d --name mergeproof-smoke -p 127.0.0.1:18000:8000 mergeproof
+          curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:18000/api/health
+      - name: Show server logs and clean up
+        if: always()
+        run: |
+          docker logs mergeproof-smoke 2>/dev/null || true
+          docker rm -f mergeproof-smoke 2>/dev/null || true
