@@ -40,20 +40,56 @@ jobs:
             docker logs mergeproof-smoke 2>&1 || true
             exit "$start_status"
           fi
-          curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:18000/api/health
-          health_status=$?
-          if [ "$health_status" -ne 0 ]; then
-            echo "Health check failed; preserving curl exit status: $health_status"
-            echo "Container list:"
+          health_file="$(mktemp)"
+          dashboard_file="$(mktemp)"
+          health_ok=0
+          for attempt in $(seq 1 30); do
+            container_state="$(docker inspect --format '{{.State.Status}}' mergeproof-smoke 2>/dev/null)"
+            if [ "$container_state" != "running" ]; then
+              echo "Container exited before health became ready (state: ${container_state:-unknown})"
+              docker ps -a --no-trunc || true
+              docker inspect --format '{{json .State}}' mergeproof-smoke 2>&1 || true
+              docker port mergeproof-smoke 2>&1 || true
+              docker logs mergeproof-smoke 2>&1 || true
+              exit 1
+            fi
+
+            health_code="$(curl --silent --show-error --connect-timeout 1 --max-time 3 \
+              --output "$health_file" --write-out '%{http_code}' \
+              http://127.0.0.1:18000/api/health 2>/dev/null)"
+            if [ "$health_code" = "200" ] && python -c "import json, pathlib; data=json.loads(pathlib.Path('$health_file').read_text()); assert data.get('status') == 'ok' and data.get('service') == 'mergeproof'"; then
+              health_ok=1
+              echo "API health ready on polling attempt $attempt"
+              break
+            fi
+
+            echo "API health not ready on attempt $attempt/30 (HTTP ${health_code:-request-failed}; container ${container_state})"
+            if [ "$attempt" -lt 30 ]; then
+              sleep 1
+            fi
+          done
+
+          if [ "$health_ok" -ne 1 ]; then
+            echo "API health did not return HTTP 200 with the expected service response within 30 seconds"
             docker ps -a --no-trunc || true
-            echo "Container state:"
             docker inspect --format '{{json .State}}' mergeproof-smoke 2>&1 || true
-            echo "Port mappings:"
             docker port mergeproof-smoke 2>&1 || true
-            echo "Full container logs:"
             docker logs mergeproof-smoke 2>&1 || true
+            exit 1
           fi
-          exit "$health_status"
+
+          dashboard_code="$(curl --silent --show-error --connect-timeout 1 --max-time 3 \
+            --output "$dashboard_file" --write-out '%{http_code}' \
+            http://127.0.0.1:18000/ 2>/dev/null)"
+          if [ "$dashboard_code" != "200" ] || ! grep -q "MergeProof" "$dashboard_file"; then
+            echo "Dashboard check failed (HTTP ${dashboard_code:-request-failed})"
+            docker ps -a --no-trunc || true
+            docker inspect --format '{{json .State}}' mergeproof-smoke 2>&1 || true
+            docker port mergeproof-smoke 2>&1 || true
+            docker logs mergeproof-smoke 2>&1 || true
+            exit 1
+          fi
+          echo "Dashboard response returned HTTP 200 and contains MergeProof"
       - name: Show server logs and clean up
         if: always()
         run: |
