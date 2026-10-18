@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="460" viewBox="0 0 1200 460" role="img" aria-labelledby="title desc">
+  <title id="title">MergeProof — Both branches pass. Prove the merge fails.</title>
+  <desc id="desc">MergeProof runs two individually passing Git changes and their combined merge in isolated clones, then records commands, exit codes and logs as a reproducible evidence bundle.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#111827"/><stop offset="1" stop-color="#17132f"/></linearGradient>
+    <linearGradient id="accent" x1="0" x2="1"><stop stop-color="#fbbf24"/><stop offset="1" stop-color="#fb923c"/></linearGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#94a3b8" opacity=".12"/></pattern>
+  </defs>
+  <rect width="1200" height="460" rx="24" fill="url(#background)"/>
+  <rect width="1200" height="460" rx="24" fill="url(#dots)"/>
+  <path d="M700 0H1100L800 460H400Z" fill="#fbbf24" opacity=".04"/>
+  <g font-family="Inter,Segoe UI,Arial,sans-serif">
+    <path d="m57 40 16-8 16 8-16 8Zm0 8 16 8 16-8M57 56l16 8 16-8" fill="none" stroke="#fbbf24" stroke-width="2.5" stroke-linejoin="round"/>
+    <text x="103" y="56" fill="#f8fafc" font-size="23.0" font-weight="700">Merge<tspan fill="#fbbf24">Proof</tspan></text>
+    <text x="56" y="128" fill="#f8fafc" font-size="54.0" font-weight="750" letter-spacing="-2">Both branches pass.</text>
+    <text x="56" y="190" fill="url(#accent)" font-size="54.0" font-weight="750" letter-spacing="-2">Prove the merge fails.</text>
+    <text x="58" y="228" fill="#cbd5e1" font-size="17.7">Run each change and the combined merge in isolation, and keep every log as evidence.</text>
+    <rect x="842" y="72" width="302" height="159" rx="14" fill="#0b1020" stroke="#37304f"/>
+    <path d="M842 110h302" stroke="#37304f"/>
+    <circle cx="861" cy="91" r="4" fill="#fbbf24"/><circle cx="876" cy="91" r="4" fill="#475569"/><circle cx="891" cy="91" r="4" fill="#475569"/>
+    <text x="916" y="96" fill="#94a3b8" font-size="12">investigation / evidence</text>
+    <g font-family="Consolas,Monaco,monospace" font-size="14.0">
+      <text x="862" y="138" fill="#fbbf24">change A<tspan fill="#94a3b8"> → tests pass</tspan></text>
+      <text x="862" y="166" fill="#fb923c">change B<tspan fill="#94a3b8"> → tests pass</tspan></text>
+      <text x="862" y="194" fill="#f87171">A + B<tspan fill="#94a3b8"> → assertion fails</tspan></text>
+    </g>
+    <g fill="#191c30" stroke="#35354e">
+      <rect x="56" y="282" width="258" height="106" rx="12"/>
+      <rect x="332" y="282" width="258" height="106" rx="12"/>
+      <rect x="608" y="282" width="258" height="106" rx="12"/>
+      <rect x="884" y="282" width="260" height="106" rx="12"/>
+    </g>
+    <g fill="#fbbf24" font-size="12" font-weight="700" letter-spacing="2">
+      <text x="76" y="309">01 / SELECT</text>
+      <text x="352" y="309">02 / ISOLATE</text>
+      <text x="628" y="309">03 / COMBINE</text>
+      <text x="904" y="309">04 / REPORT</text>
+    </g>
+    <text x="76" y="341" fill="#f1f5f9" font-size="17.0" font-weight="650">Pick two branches</text>
+    <text x="76" y="367" fill="#94a3b8" font-size="13.0">Local Git checkout + merge-base</text>
+    <text x="352" y="341" fill="#f1f5f9" font-size="17.0" font-weight="650">Run each change alone</text>
+    <text x="352" y="367" fill="#94a3b8" font-size="13.0">Clean temporary clones</text>
+    <text x="628" y="341" fill="#f1f5f9" font-size="17.0" font-weight="650">Test the merged result</text>
+    <text x="628" y="367" fill="#94a3b8" font-size="13.0">Same command, same evidence</text>
+    <text x="904" y="341" fill="#f1f5f9" font-size="17.0" font-weight="650">Export the proof</text>
+    <text x="904" y="367" fill="#94a3b8" font-size="13.0">Logs, diffs and REPRODUCE.md</text>
+    <text x="56" y="428" fill="#64748b" font-size="13">Python standard library · Git · Docker · GitHub Actions</text>
+  </g>
+</svg>

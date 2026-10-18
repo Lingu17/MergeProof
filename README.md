@@ -1,76 +1,137 @@
-# MergeProof
+<p align="center">
+  <img src="docs/assets/readme-hero.svg" alt="MergeProof — Both branches pass. Prove the merge fails. Select, isolate, combine, report." width="1200" />
+</p>
 
-MergeProof is an evidence-first demo for finding bugs that only appear when two individually passing code changes are combined.
+<p align="center">
+  <strong>Evidence-first Git integration investigations.</strong><br />
+  Find the bugs that only appear when two individually passing changes are merged, and keep the proof.
+</p>
 
-## Requirements
+<p align="center">
+  <a href="https://github.com/Lingu17/MergeProof/actions/workflows/rebuild.yml"><img src="https://github.com/Lingu17/MergeProof/actions/workflows/rebuild.yml/badge.svg?branch=master" alt="Linux rebuild and offline tests" /></a>
+  <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square" alt="Python 3.11" />
+  <img src="https://img.shields.io/badge/Dependencies-standard%20library%20only-111827?style=flat-square" alt="No third-party Python packages" />
+  <img src="https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square" alt="Docker image" />
+  <img src="https://img.shields.io/badge/License-MIT-16a34a?style=flat-square" alt="MIT License" />
+</p>
+
+<p align="center">
+  <a href="#the-product">Product</a> ·
+  <a href="#engineering-decisions">Engineering</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#verification">Verification</a> ·
+  <a href="#run-locally">Run locally</a> ·
+  <a href="#creator">Creator</a>
+</p>
+
+---
+
+## The product
+
+Change A passes its tests. Change B passes its tests. Merge them, and something breaks: a renamed key, a changed default, an assumption that only one side knew about. Code review rarely catches it, because each diff looks correct on its own.
+
+**MergeProof runs each change and the combined merge in clean, isolated clones, then records exactly what happened.** It reports a confirmed interaction only when both independent runs pass and the combined run fails with real assertion evidence. Everything else is labeled for what it is.
+
+| Capability | What you can do |
+| :--- | :--- |
+| **Repository import** | Validate and store a local Git checkout, list its branches, and inspect the `merge-base` of any two. |
+| **Isolated execution** | Run your test command on branch A, branch B and the combined merge, each in its own temporary clone at an exact commit SHA. |
+| **Honest classification** | Separate assertion failures from syntax errors, missing dependencies, timeouts, merge conflicts and other execution errors. |
+| **Background investigations** | Queue an investigation, follow its progress, and cancel it cooperatively without marking it failed. |
+| **Evidence bundle** | Download a ZIP with the JSON report, full logs, source diffs and a `REPRODUCE.md` with the exact commands. |
+| **Dashboard** | A local web UI with live counts, recent activity, investigation history and a clearly labeled sample repository. |
+
+### A workflow you can follow
+
+**Select two branches → run each alone → run the merge → classify → export the proof**
+
+## Engineering decisions
+
+| Engineering problem | Implementation | Inspect the code |
+| :--- | :--- | :--- |
+| A failing exit code is not proof of a broken test | Only assertion tracebacks, pytest `assert` failures or unittest's failure summary count as `test_failure`. Syntax, import and other errors are classified separately. | [`classify_failure`](app.py#L274) |
+| A merge conflict must never look like a confirmed bug | `summary.confirmed` requires tests to run in all three roles, A and B to pass, and the combined run to fail with a test failure and a log. | [`_confirmed`](app.py#L399) |
+| Runs must not leak state into each other | Every role gets a fresh `git clone --no-local --no-hardlinks`; remote-only commits are fetched into private refs and executed by SHA. | [`_clone`](app.py#L301), [`run_branch`](app.py#L322), [`run_combined`](app.py#L340) |
+| Long or stuck test suites | Commands run with a deadline and poll a cancel event, so timeouts and user cancellations end cleanly with their own status. | [`run_command`](app.py#L235) |
+| Investigations should not block the UI | A single daemon worker thread consumes a queue and persists progress after each role. | [`InvestigationWorker`](app.py#L530) |
+| Results need to be reproducible by someone else | The report, logs, diffs and reproduction steps are packed into one downloadable bundle. | [`evidence_bundle`](app.py#L53) |
+
+MergeProof does **not** include runtime AI reasoning. Git and test evidence stay deterministic; an AI layer could later propose hypotheses or targeted regression tests whose claims remain unverified until executed.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    UI[web/index.html dashboard] --> API[ThreadingHTTPServer JSON API]
+    API --> STORE[(mergeproof-data.json)]
+    API --> Q[Investigation queue]
+    Q --> W[Daemon worker]
+    W --> A[Clone + test branch A]
+    W --> B[Clone + test branch B]
+    W --> C[Clone + merge + test A+B]
+    A & B & C --> R[Classification + report]
+    R --> STORE
+    R --> ZIP[Evidence bundle ZIP]
+```
+
+- **Backend:** one Python file ([`app.py`](app.py)) using only the standard library: `http.server`, `subprocess`, `threading`, `zipfile`.
+- **Frontend:** a single static page ([`web/index.html`](web/index.html)) served by the same process.
+- **Storage:** a local JSON file (`mergeproof-data.json`, or `MERGEPROOF_DATA_FILE`). A labeled `checkout-service (sample)` record is created with every new store.
+- **Fixture:** [`demo_repo/`](demo_repo) holds `change_a`, `change_b` and `combined` versions of a small service that reproduce a real interaction.
+
+## Verification
+
+| Gate | Evidence |
+| :--- | :--- |
+| Regression suite | **20 tests passed** locally (`python -m unittest discover -s tests`) |
+| Linux rebuild | The [rebuild workflow](https://github.com/Lingu17/MergeProof/actions/workflows/rebuild.yml) builds the image on Ubuntu, runs the suite with `--network none` and no personal Git config, then checks `/api/health` on a running container. |
+| Sample investigation | Change A and Change B pass independently; the combined snapshot reproduces a failing assertion. The fixture is *meant* to fail inside its investigation, while the suite itself exits with `OK`. |
+
+<details>
+<summary><strong>Scope and known limitations</strong></summary>
+
+- Local-only application: no hosted accounts, billing, teams or remote provider imports. Repository import means a path to a local Git checkout.
+- Repository tests execute code with the privileges of the process or container. Only run trusted repositories.
+- Hosted multi-user execution is out of scope for this prototype.
+- A documented Dockerfile alone is not proof of a successful run; check the workflow result for the commit you are using.
+
+</details>
+
+## Run locally
+
+### Requirements
 
 - Python **3.11.17**, pinned in `.python-version` and the Docker image.
-- Git on your PATH. No personal Git identity is needed for temporary executions.
-- Docker Engine/Desktop for the clean Linux rebuild below.
+- Git on your `PATH`. No personal Git identity is needed for temporary executions.
+- Docker Engine or Desktop for the clean Linux rebuild.
 
-There are no third-party Python packages. `requirements.lock` is intentionally empty apart from comments; it locks the complete Python dependency set. The image installs Git as an OS package. The Python base image is pinned by tag and content digest; Debian package mirrors are still used at build time, so internet access is required for a fresh build. Tests do not require internet access.
-
-Clone the public source:
+There are no third-party Python packages. `requirements.lock` is intentionally empty apart from comments; it locks the complete dependency set.
 
 ```bash
 git clone https://github.com/Lingu17/MergeProof.git
 cd MergeProof
-```
-
-## Run it
-
-```bash
 python -m pip install --no-index --require-hashes -r requirements.lock
 python app.py
 ```
 
-These two commands also work in PowerShell. The default configuration needs no `.env` file. Optional settings are documented in `.env.example`; the app reads environment variables, not `.env` files automatically. In Bash, load overrides with `cp .env.example .env`, then `set -a; . ./.env; set +a`. In PowerShell, set individual variables, for example `$env:MERGEPROOF_PORT = '8765'` before running the app. Do not commit real secrets.
+Open [http://localhost:8000](http://localhost:8000). The dashboard runs a real Python fixture analysis right away.
 
-Open http://localhost:8000. The dashboard runs a real Python fixture analysis: Change A and Change B each pass their own tests, while the combined snapshot reproduces a failing integration test.
+The server binds to `127.0.0.1` by default. Optional settings are documented in [`.env.example`](.env.example); the app reads environment variables, not `.env` files. In Bash: `cp .env.example .env`, then `set -a; . ./.env; set +a`. In PowerShell, set variables individually, for example `$env:MERGEPROOF_PORT = '8765'`.
 
-The local server binds to `127.0.0.1` by default. Set `MERGEPROOF_BIND_HOST` when a different interface is required. The image installs Git because real repository investigations clone clean Git snapshots.
+| Variable | Purpose |
+| :--- | :--- |
+| `MERGEPROOF_PORT` | HTTP port (default `8000`) |
+| `MERGEPROOF_BIND_HOST` | Interface to bind (default `127.0.0.1`) |
+| `MERGEPROOF_DATA_FILE` | JSON store location (default `mergeproof-data.json` beside `app.py`) |
 
-The backend stores repositories, investigations, test runs, and reports in `mergeproof-data.json` beside `app.py`. Set `MERGEPROOF_DATA_FILE` to use another local JSON file. The built-in `checkout-service (sample)` repository is retained as a clearly labeled sample record whenever a new store is created.
-
-## API
-
-All request and response bodies are JSON.
-
-* `POST /api/repositories` with `{ "path": "/absolute/path/to/git/repo" }` validates and stores a local Git repository. `POST /api/repositories/validate` validates without storing; `GET /api/repositories` lists stored repositories.
-* `GET /api/repositories/:id/inspect?branch_a=...&branch_b=...` returns local branches and their `merge-base`. `POST /api/investigations` accepts `repository_id`, `branch_a`, `branch_b`, and optional `test_command` (default: `python -m unittest discover -v`).
-* `GET /api/investigations` lists investigations and `GET /api/investigations/:id` retrieves one. `POST /api/investigations/:id/start` copies the repository into isolated temporary directories, runs both branches independently and then runs the combined merge, and persists every command, status, exit code, and full log.
-* `GET /api/investigations/:id/runs`, `/history`, and `/progress` expose the persisted run evidence and background state. `POST /api/investigations/:id/start` queues work and `POST /api/investigations/:id/cancel` requests cooperative cancellation. `GET /api/investigations/:id/report` returns the saved report; use `/api/reports/:id/download` for JSON or `/api/reports/:id/bundle` for a ZIP containing the report, logs, diffs, and `REPRODUCE.md`.
-
-The report marks `summary.confirmed` only when independent A passes, independent B passes, and the combined run fails. The existing `GET /api/analysis` sample endpoint remains available and continues to execute the fixture locally.
-
-## Checks
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-## Docker
-
-Build and run with an explicit container exposure setting:
+### Docker
 
 ```bash
 docker build -t mergeproof .
 docker run --rm -p 127.0.0.1:8000:8000 -v mergeproof-data:/data mergeproof
 ```
 
-Open http://localhost:8000. The named volume preserves investigations when the container is recreated. Stop the foreground server with Ctrl+C. The Docker image listens on `0.0.0.0` inside its container; the published port above is limited to host localhost. Container data lives at `/data/mergeproof-data.json`; direct local runs retain the local default. `/app` and `/data` are portable container paths, not paths from a developer's machine.
-
-Run the offline regression suite inside the image with:
-
-```bash
-docker run --rm --network none -e GIT_CONFIG_GLOBAL=/dev/null -e GIT_CONFIG_NOSYSTEM=1 mergeproof python -m unittest discover -s tests -v
-```
-
-This is the same test command used locally. The container flags disable network access and personal/system Git configuration. The deliberately failing sample fixture is expected to fail *inside its investigation*; the regression suite itself must finish with `OK` and exit code zero.
-
-The [Linux rebuild workflow](https://github.com/Lingu17/MergeProof/actions/workflows/rebuild.yml) builds the image on an Ubuntu runner, runs the offline test command above, and checks `/api/health` on a running container. A documented Dockerfile alone is not proof of a successful run; inspect the workflow result for the submitted commit.
-
-To analyze a host repository, mount it read-only into the container and use the mounted path in the Repositories screen, for example:
+The named volume keeps investigations when the container is recreated; container data lives at `/data/mergeproof-data.json`. To analyze a host repository, mount it read-only and use the mounted path in the Repositories screen:
 
 ```bash
 docker run --rm -p 127.0.0.1:8000:8000 \
@@ -79,18 +140,58 @@ docker run --rm -p 127.0.0.1:8000:8000 \
   mergeproof
 ```
 
-Use `/repos/my-repository` in the UI. The example assumes `my-repository` exists beneath your current folder; replace that relative location with your own checkout. Read-only mounting protects the source checkout, but repository tests still execute code with the container's privileges. Only run trusted repositories. Hosted accounts and public multi-user execution are outside this prototype's scope.
+Run the offline regression suite inside the image:
 
-The project is released under the MIT License (`LICENSE`).
+```bash
+docker run --rm --network none -e GIT_CONFIG_GLOBAL=/dev/null -e GIT_CONFIG_NOSYSTEM=1 mergeproof python -m unittest discover -s tests -v
+```
 
-The UI is a local-only application: it does not provide hosted accounts, billing, teams, or remote provider imports. Repository import currently means a path to a local Git checkout. `/api/health` exposes the backend version used by the UI; `/api/overview` provides live dashboard counts and recent activity.
+## API
+
+All request and response bodies are JSON.
+
+| Area | Routes |
+| :--- | :--- |
+| Health & overview | `GET /api/health`, `GET /api/overview` |
+| Repositories | `GET` / `POST /api/repositories`, `POST /api/repositories/validate`, `GET /api/repositories/:id/inspect?branch_a=…&branch_b=…` |
+| Investigations | `GET` / `POST /api/investigations`, `GET /api/investigations/:id` |
+| Execution | `POST /api/investigations/:id/start`, `POST /api/investigations/:id/cancel` |
+| Evidence | `GET /api/investigations/:id/runs`, `/history`, `/progress`, `/report` |
+| Downloads | `GET /api/reports/:id/download` (JSON), `GET /api/reports/:id/bundle` (ZIP) |
+| Sample | `GET /api/analysis` runs the bundled fixture |
+
+`POST /api/investigations` accepts `repository_id`, `branch_a`, `branch_b` and an optional `test_command` (default `python -m unittest discover -v`).
 
 ## Demo outline
 
-1. Open the clearly labelled `checkout-service (sample)` repository and create the fixed `change_a` + `change_b` comparison.
+1. Open the `checkout-service (sample)` repository and create the `change_a` + `change_b` comparison.
 2. Review the base/change/combined table, then start the background analysis.
-3. Show two passing independent checks and the combined assertion failure; open the saved source diff and logs.
+3. See two passing independent checks and the combined assertion failure; open the saved diff and logs.
 4. Download the evidence bundle and open `REPRODUCE.md`.
-5. Add a real local Git repository, select two branches, provide its test command, and repeat the same workflow. The same engine reports a neutral all-green result, a confirmed assertion interaction, or a setup/merge/runtime result without conflating them.
+5. Add a real local Git repository, pick two branches and a test command, and repeat. The same engine reports an all-green result, a confirmed interaction, or a setup/merge/runtime result without conflating them.
 
-MergeProof does not currently include runtime AI reasoning. This prototype keeps deterministic Git/test evidence separate; an AI layer can later propose hypotheses or targeted regression tests whose claims remain unverified until execution.
+## Project map
+
+```text
+MergeProof/
+├── app.py                     HTTP API, Git execution, classification, worker, evidence bundle
+├── web/index.html             Single-page dashboard
+├── demo_repo/                 change_a, change_b and combined fixture versions
+├── tests/
+│   ├── test_analysis.py       Fixture analysis regression
+│   └── test_backend.py        API, store, execution and classification tests
+├── Dockerfile                 Pinned Python image with Git
+├── requirements.lock          Empty, hash-locked dependency set
+├── .env.example               Optional settings
+└── .github/workflows/rebuild.yml  Linux rebuild, offline tests and health check
+```
+
+## Creator
+
+**Lingraj Malipatil** · [GitHub @Lingu17](https://github.com/Lingu17) · [LinkedIn](https://www.linkedin.com/in/lingraj-malipatil-a2735a241/)
+
+Released under the [MIT License](LICENSE). For a technical walkthrough, start with [`classify_failure`](app.py#L274), [`_confirmed`](app.py#L399) and the [backend tests](tests/test_backend.py).
+
+---
+
+<p align="center"><strong>MergeProof</strong><br />Two green builds are not a green merge. Prove it.</p>
